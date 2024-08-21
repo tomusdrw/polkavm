@@ -1,41 +1,86 @@
+#![allow(non_snake_case)]
+
+use std::sync::Mutex;
+
 use wasm_bindgen::prelude::wasm_bindgen;
 
+#[repr(C)]
 #[wasm_bindgen]
-pub fn reset(_program: Vec<u8>, _gas: u32) {
+#[derive(Copy, Clone)]
+pub enum Status {
+    Ok = 0,
+    Halt = 1,
+    Panic = 2,
+    OutOfGas = 3,
+}
+
+static PVM: Mutex<Option<Pvm>> = Mutex::new(None);
+
+pub struct Pvm {
+    pc: u32,
+    program: Vec<u8>,
+    gas: u32,
+    status: Status,
+    registers: Vec<u8>,
+}
+impl Pvm {
+    fn new(program: Vec<u8>, registers: Vec<u8>, gas: u32) -> Self {
+        Self {
+            pc: 0,
+            program,
+            gas,
+            status: Status::Ok,
+            registers,
+        }
+    }
+
+    fn next_step(&mut self) -> bool {
+        self.pc += 1;
+        if (self.pc as usize) < self.program.len() {
+            true 
+        } else {
+            self.status = Status::Halt;
+            false
+        }
+    }
+}
+
+fn with_pvm<F, R>(mut f: F) -> R where F: FnMut(&mut Pvm) -> R {
+    let mut pvm_l = PVM.lock().unwrap();
+    f(pvm_l.as_mut().unwrap())
 }
 
 #[wasm_bindgen]
-pub fn get_program_counter() -> u32 {
-    return 0;
+pub fn reset(program: Vec<u8>, registers: Vec<u8>, gas: u32) {
+    *PVM.lock().unwrap() = Some(Pvm::new(program, registers, gas));
 }
 
-/*
-  /**
-   * Get the current status of PVM
-   */
-  getStatus(): number;
-  /**
-   * Return gas left.
-   */
-  getGasLeft(): number;
-  /**
-   * Return registers dump.
-   * 
-   * We expect 13 values, 4 bytes each, representing the state of all registers as a single byte array.
-   */
-  getRegisters(): Uint8Array;
-  /**
-   * Perform a single step of PVM execution.
-   */
-  nextStep(): boolean;
-  /**
-   * Returns a undefined-length page from memory at given index.
-   * 
-   * it's up to the implementation to decide if this is going to return just a single memory cell,
-   * or a page of some specific size.
-   * The page sizes should always be the same though (i.e. the UI will assume that if page 0 has size `N`
-   * every other page has the same size).
-   */
-  getPageDump(pageIndex: number): Uint8Array;
+#[wasm_bindgen]
+pub fn nextStep() -> bool {
+    with_pvm(|pvm| pvm.next_step())
 }
-*/
+
+#[wasm_bindgen]
+pub fn getProgramCounter() -> u32 {
+    with_pvm(|pvm| pvm.pc)
+}
+
+#[wasm_bindgen]
+pub fn getStatus() -> Status {
+    with_pvm(|pvm| pvm.status)
+}
+
+#[wasm_bindgen]
+pub fn getGasLeft() -> u32 {
+    with_pvm(|pvm| pvm.gas)
+}
+
+#[wasm_bindgen]
+pub fn getRegisters() -> Vec<u8> {
+    with_pvm(|pvm| pvm.registers.clone())
+}
+
+#[wasm_bindgen]
+pub fn getPageDump(index: u32) -> Vec<u8> {
+    return vec![index as u8];
+}

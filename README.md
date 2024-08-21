@@ -11,6 +11,15 @@ $ cargo install wasm-pack
 ## Building
 
 ```
-$ wasm-pack build --target web
+$ wasm-pack build --target bundler
 ```
 
+That will create a `pkg` folder that's a valid nodejs module.
+
+## Running
+
+```
+$ cd www
+$ npm ci
+$ npm start
+```
