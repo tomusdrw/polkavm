@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use core::fmt::Write;
-use polkavm::{Engine, Linker, Module, ModuleConfig, ProgramBlob, Reg};
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg};
 use polkavm_common::assembler::assemble;
 use polkavm_common::program::ProgramParts;
 use std::path::{Path, PathBuf};
@@ -93,11 +93,14 @@ fn main_generate() {
 
     let engine = Engine::new(&config).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
+    let mut found_errors = false;
     for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let path = entry.unwrap().path();
         let test_case = prepare_file(&engine, &*path);
         if let Ok(test_case) = test_case {
             tests.push(test_case);
+        } else {
+            found_errors = true;
         }
     }
 
@@ -236,6 +239,10 @@ fn main_generate() {
     }
 
     std::fs::write(root.join("output").join("TESTCASES.md"), index_md).unwrap();
+
+    if found_errors {
+        std::process::exit(1);
+    }
 }
 
 fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
@@ -245,6 +252,7 @@ fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
     let name = path.file_stem().unwrap().to_string_lossy();
     let input = std::fs::read_to_string(&path).unwrap();
     let mut input_lines = Vec::new();
+
     for line in input.lines() {
         if let Some(line) = line.strip_prefix("pre:") {
             let line = line.trim();
@@ -270,7 +278,7 @@ fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
         Ok(blob) => blob,
         Err(error) => {
             eprintln!("Failed to assemble {path:?}: {error}");
-            return Err(());
+            return Err(())
         }
     };
 
@@ -280,10 +288,10 @@ fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
     let mut module_config = ModuleConfig::default();
     module_config.set_strict(true);
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+    module_config.set_step_tracing(true);
 
     let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
-    let linker = Linker::new(&engine);
-    let instance = linker.instantiate_pre(&module).unwrap().instantiate().unwrap();
+    let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
     let mut initial_memory = Vec::new();
@@ -316,55 +324,59 @@ fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
         });
     }
 
-    let initial_pc = blob
-        .exports()
-        .find(|export| export.symbol().as_bytes() == b"main")
-        .unwrap()
-        .target_code_offset();
+    let initial_pc = blob.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
 
     #[allow(clippy::map_unwrap_or)]
     let expected_final_pc = blob
         .exports()
-        .find(|export| export.symbol().as_bytes() == b"expected_exit")
-        .map(|export| export.target_code_offset())
+        .find(|export| export.symbol() == "expected_exit")
+        .map(|export| export.program_counter().0)
         .unwrap_or(blob.code().len() as u32);
 
-    let export_index = module.lookup_export("main").unwrap();
-    let mut user_data = ();
-    let mut state_args = polkavm::StateArgs::default();
-    state_args.set_gas(polkavm::Gas::new(initial_gas as u64).unwrap());
+    instance.set_gas(initial_gas);
+    instance.set_next_program_counter(initial_pc);
 
-    let mut call_args = polkavm::CallArgs::new(&mut user_data, export_index);
     for (reg, value) in Reg::ALL.into_iter().zip(initial_regs) {
-        call_args.reg(reg, value);
+        instance.set_reg(reg, value);
     }
 
-    let expected_status = match instance.call(state_args, call_args) {
-        Ok(()) => "halt",
-        Err(polkavm::ExecutionError::Trap(..)) => "trap",
-        Err(polkavm::ExecutionError::OutOfGas) => "out-of-gas",
-        Err(polkavm::ExecutionError::Error(error)) => unreachable!("unexpected error: {error}"),
+    let mut final_pc = initial_pc;
+    let expected_status = loop {
+        match instance.run().unwrap() {
+            InterruptKind::Finished => break "halt",
+            InterruptKind::Trap => break "trap",
+            InterruptKind::Ecalli(..) => todo!(),
+            InterruptKind::NotEnoughGas => break "out-of-gas",
+            InterruptKind::Segfault(..) => todo!(),
+            InterruptKind::Step => {
+                final_pc = instance.program_counter().unwrap();
+                continue;
+            }
+        }
     };
 
-    let final_pc = instance.program_counter().unwrap();
-    if final_pc != expected_final_pc {
+    if expected_status != "halt" {
+        final_pc = instance.program_counter().unwrap();
+    }
+
+    if final_pc.0 != expected_final_pc {
         eprintln!("Unexpected final program counter for {path:?}: expected {expected_final_pc}, is {final_pc}");
-        return Err(());
+        return Err(())
     }
 
     let mut expected_regs = Vec::new();
     for reg in Reg::ALL {
-        let value = instance.get_reg(reg);
+        let value = instance.reg(reg);
         expected_regs.push(value);
     }
 
     let mut expected_memory = Vec::new();
     for page in &initial_page_map {
-        let memory = instance.read_memory_into_vec(page.address, page.length).unwrap();
+        let memory = instance.read_memory(page.address, page.length).unwrap();
         expected_memory.extend(extract_chunks(page.address, &memory));
     }
 
-    let expected_gas = instance.gas_remaining().unwrap().get() as i64;
+    let expected_gas = instance.gas();
 
     let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
     disassembler.show_raw_bytes(true);
@@ -377,12 +389,13 @@ fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
     disassembler.disassemble_into(&mut disassembly).unwrap();
     let disassembly = String::from_utf8(disassembly).unwrap();
 
+
     Ok(Testcase {
         disassembly,
         json: TestcaseJson {
             name: name.into(),
             initial_regs,
-            initial_pc,
+            initial_pc: initial_pc.0,
             initial_page_map,
             initial_memory,
             initial_gas,
@@ -401,7 +414,7 @@ fn main_test() {
 }
 
 fn main_prepare(input: PathBuf) {
-let mut config = polkavm::Config::new();
+    let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
     let engine = Engine::new(&config).unwrap();
 

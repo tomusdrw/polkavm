@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 authors = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
 license = "MIT/Apache-2.0"
 edition = "2021"
@@ -30,15 +30,15 @@ rust-version = "1.75.0"
 repository = "https://github.com/koute/polkavm"
 
 [workspace.dependencies]
-polkavm                   = { version = "0.10.0", path = "crates/polkavm" }
-polkavm-assembler         = { version = "0.10.0", path = "crates/polkavm-assembler" }
-polkavm-disassembler      = { version = "0.10.0", path = "crates/polkavm-disassembler" }
-polkavm-common            = { version = "0.10.0", path = "crates/polkavm-common" }
-polkavm-derive            = { version = "0.10.0", path = "crates/polkavm-derive" }
-polkavm-derive-impl       = { version = "0.10.0", path = "crates/polkavm-derive-impl" }
-polkavm-derive-impl-macro = { version = "0.10.0", path = "crates/polkavm-derive-impl-macro" }
-polkavm-linker            = { version = "0.10.0", path = "crates/polkavm-linker" }
-polkavm-linux-raw         = { version = "0.10.0", path = "crates/polkavm-linux-raw" }
+polkavm                   = { version = "0.11.0", path = "crates/polkavm" }
+polkavm-assembler         = { version = "0.11.0", path = "crates/polkavm-assembler" }
+polkavm-disassembler      = { version = "0.11.0", path = "crates/polkavm-disassembler" }
+polkavm-common            = { version = "0.11.0", path = "crates/polkavm-common" }
+polkavm-derive            = { version = "0.11.0", path = "crates/polkavm-derive" }
+polkavm-derive-impl       = { version = "0.11.0", path = "crates/polkavm-derive-impl" }
+polkavm-derive-impl-macro = { version = "0.11.0", path = "crates/polkavm-derive-impl-macro" }
+polkavm-linker            = { version = "0.11.0", path = "crates/polkavm-linker" }
+polkavm-linux-raw         = { version = "0.11.0", path = "crates/polkavm-linux-raw" }
 
 clap = "4.4.6"
 env_logger = { version = "0.10.0", default-features = false }
@@ -58,12 +58,16 @@ serde = { version = "1.0.203", features = ["derive"] }
 serde_json = { version = "1.0.117" }
 syn = "2.0.25"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(polkavm_dev_debug_zygote)'] }
+
 [workspace.lints.clippy]
 # This also triggers on cases like `.or_insert_with(Vec::new)`.
 unwrap_or_default = "allow"
 get_first = "allow"
 manual_range_contains = "allow"
 let_unit_value = "allow"
+unit_arg = "allow"
 
 # These are are 'allow' by default.
 alloc_instead_of_core = "warn"
@@ -137,7 +141,6 @@ ptr_as_ptr = "warn"
 ptr_cast_constness = "warn"
 # pub_underscore_fields = "warn"
 range_minus_one = "warn"
-range_plus_one = "warn"
 read_zero_byte_vec = "warn"
 readonly_write_lock = "warn"
 redundant_clone = "warn"
