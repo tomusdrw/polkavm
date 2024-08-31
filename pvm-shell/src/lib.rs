@@ -1,12 +1,13 @@
 #![allow(non_snake_case)]
 
 use std::sync::Mutex;
-
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, RawInstance, Reg};
+use polkavm_common::program::ProgramParts;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 #[repr(C)]
 #[wasm_bindgen]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Status {
     Ok = 0,
     Halt = 1,
@@ -14,83 +15,143 @@ pub enum Status {
     OutOfGas = 3,
 }
 
-static PVM: Mutex<Option<Pvm>> = Mutex::new(None);
+static PVM: Mutex<Option<RawInstance>> = Mutex::new(None);
+static STATUS: Mutex<Status> = Mutex::new(Status::Ok);
 
-pub struct Pvm {
-    pc: u32,
-    program: Vec<u8>,
-    gas: i64,
-    status: Status,
-    registers: Vec<u8>,
-}
-impl Pvm {
-    fn new(program: Vec<u8>, registers: Vec<u8>, gas: i64) -> Self {
-        Self {
-            pc: 0,
-            program,
-            gas,
-            status: Status::Ok,
-            registers,
-        }
-    }
+const NO_OF_REGISTERS: usize = 13;
+const BYTES_PER_REG: usize = 4;
 
-    fn next_step(&mut self) -> bool {
-        self.pc += 1;
-        if (self.pc as usize) < self.program.len() {
-            true
-        } else {
-            self.status = Status::Halt;
-            false
-        }
-    }
-}
-
-fn with_pvm<F, R>(mut f: F, default: R) -> R
-where
-    F: FnMut(&mut Pvm) -> R,
-{
+fn with_pvm<F, R>(f: F, default: R) -> R where F: FnMut(&mut RawInstance) -> R {
     let pvm_l = PVM.lock();
-    match pvm_l.ok() {
-        Some(mut guard) => match guard.as_mut() {
-            Some(pvm_l) => f(pvm_l),
-            None => default,
-        },
-        None => default,
+    if let Ok(mut pvm_l) = pvm_l {
+        pvm_l.as_mut().map(f).unwrap_or(default)
+    } else {
+        default
     }
 }
 
 #[wasm_bindgen]
 pub fn reset(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
-    *PVM.lock().unwrap() = Some(Pvm::new(program, registers, gas));
+    let mut config = polkavm::Config::new();
+    config.set_backend(Some(polkavm::BackendKind::Interpreter));
+
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_strict(true);
+    module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+    module_config.set_step_tracing(true);
+
+    let mut parts = ProgramParts::default();
+    parts.code_and_jump_table = program.into();
+    let blob = ProgramBlob::from_parts(parts).unwrap();
+
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let mut instance = module.instantiate().unwrap();
+
+    instance.set_gas(gas);
+    instance.set_next_program_counter(ProgramCounter(0));
+
+    for (i, reg) in (0..NO_OF_REGISTERS).zip(Reg::ALL) {
+        let start_bytes = i * BYTES_PER_REG;
+        let mut reg_value = [0u8; BYTES_PER_REG];
+        reg_value.copy_from_slice(&registers[start_bytes .. start_bytes + BYTES_PER_REG]);
+
+        instance.set_reg(reg, u32::from_le_bytes(reg_value));
+    }
+
+    *PVM.lock().unwrap() = Some(instance);
 }
 
 #[wasm_bindgen]
 pub fn nextStep() -> bool {
-    with_pvm(|pvm| pvm.next_step(), false)
+    let (can_continue, status) = with_pvm(|pvm| {
+        match pvm.run() {
+            Ok(InterruptKind::Finished) => {
+                (false, Status::Halt)
+            },
+            Ok(InterruptKind::Trap) => {
+                (false, Status::Panic)
+            },
+            Ok(InterruptKind::Ecalli(_)) => {
+                // TODO [ToDr] handle ecalli
+                (true, Status::Ok)
+            },
+            Ok(InterruptKind::Segfault(_)) => {
+                (false, Status::Panic)
+            },
+            Ok(InterruptKind::NotEnoughGas) => {
+                (false, Status::OutOfGas)
+            },
+            Ok(InterruptKind::Step) => {
+                (true, Status::Ok)
+            },
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                (false, Status::Panic)
+            },
+        }
+    }, (false, Status::Panic));
+    *STATUS.lock().unwrap() = status;
+    can_continue
 }
 
 #[wasm_bindgen]
 pub fn getProgramCounter() -> u32 {
-    with_pvm(|pvm| pvm.pc, 0)
+    with_pvm(|pvm| pvm.program_counter().map(|x| x.0).unwrap_or(0), 0)
 }
 
 #[wasm_bindgen]
 pub fn getStatus() -> Status {
-    with_pvm(|pvm| pvm.status, Status::Ok)
+    *STATUS.lock().unwrap()
 }
 
 #[wasm_bindgen]
 pub fn getGasLeft() -> i64 {
-    with_pvm(|pvm| pvm.gas, 0)
+    with_pvm(|pvm| pvm.gas(), 0)
 }
 
 #[wasm_bindgen]
 pub fn getRegisters() -> Vec<u8> {
-    let default_registers = vec![0; 13 * 4];
-    with_pvm(|pvm| pvm.registers.clone(), default_registers)
+    let mut registers = vec![0u8; NO_OF_REGISTERS * BYTES_PER_REG];
+    with_pvm(|pvm| {
+        for (i, reg) in (0..NO_OF_REGISTERS).zip(Reg::ALL) {
+            let start_byte = i * BYTES_PER_REG;
+            let val_le_bytes = pvm.reg(reg).to_le_bytes();
+            registers[start_byte..start_byte +BYTES_PER_REG].copy_from_slice(&val_le_bytes);
+        }
+    }, ());
+
+    registers
 }
 
 #[wasm_bindgen]
 pub fn getPageDump(index: u32) -> Vec<u8> {
     return vec![index as u8];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_simple_program() {
+        let program = vec![
+            0,
+            0,
+            3,
+            8,
+            135,
+            9,
+            249
+        ];
+        let registers = vec![0u8; 13 * 4];
+        reset(program, registers, 10_000);
+        loop {
+            let can_continue = nextStep();
+            println!("Status: {:?}, PC: {}", getStatus(), getProgramCounter());
+            if !can_continue {
+                break;
+            }
+        }
+    }
 }

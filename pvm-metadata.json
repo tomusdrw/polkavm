@@ -1,0 +1,10 @@
+{
+  "name": "polkavm",
+  "version": "0.11.0-c26d07",
+  "capabilities": {
+    "resetJAM": false,
+    "resetGeneric": true,
+    "resetPolkaVM": false
+  },
+  "wasmBlobUrl": "./pvm-shell/pkg/pvm_shell_bg.wasm"
+}
