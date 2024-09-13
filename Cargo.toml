@@ -18,7 +18,7 @@ members = [
     "tools/spectool",
 
     "examples/doom",
-    "examples/hello-world",
+    "examples/hello-world", "tools/spectool-wasm",
 ]
 
 [workspace.package]
