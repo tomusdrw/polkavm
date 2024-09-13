@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::use_debug)]
 
-use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg};
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, Reg};
 use polkavm_common::assembler::assemble;
 use polkavm_common::program::ProgramParts;
 
@@ -67,7 +67,12 @@ pub fn new_engine() -> Engine {
     Engine::new(&config).unwrap()
 }
 
-pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcase, String> {
+pub fn prepare_input(
+    input: &str,
+    engine: &Engine,
+    name: &str,
+    execute: bool,
+) -> Result<Testcase, String> {
     let mut initial_regs = [0; 13];
     let mut initial_gas = 10000;
 
@@ -145,7 +150,10 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcas
         });
     }
 
-    let initial_pc = blob.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
+    let initial_pc = blob.exports()
+        .find(|export| export.symbol() == "main")
+        .map(|x| x.program_counter())
+        .unwrap_or(ProgramCounter(0));
 
     #[allow(clippy::map_unwrap_or)]
     let expected_final_pc = blob
@@ -162,25 +170,29 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcas
     }
 
     let mut final_pc = initial_pc;
-    let expected_status = loop {
-        match instance.run().unwrap() {
-            InterruptKind::Finished => break "halt",
-            InterruptKind::Trap => break "trap",
-            InterruptKind::Ecalli(..) => todo!(),
-            InterruptKind::NotEnoughGas => break "out-of-gas",
-            InterruptKind::Segfault(..) => todo!(),
-            InterruptKind::Step => {
-                final_pc = instance.program_counter().unwrap();
-                continue;
+    let expected_status = if execute {
+        loop {
+            match instance.run().unwrap() {
+                InterruptKind::Finished => break "halt",
+                InterruptKind::Trap => break "trap",
+                InterruptKind::Ecalli(..) => todo!(),
+                InterruptKind::NotEnoughGas => break "out-of-gas",
+                InterruptKind::Segfault(..) => todo!(),
+                InterruptKind::Step => {
+                    final_pc = instance.program_counter().unwrap();
+                    continue;
+                }
             }
         }
+    } else {
+        "halt"
     };
 
     if expected_status != "halt" {
         final_pc = instance.program_counter().unwrap();
     }
 
-    if final_pc.0 != expected_final_pc {
+    if execute && final_pc.0 != expected_final_pc {
         let msg = format!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
         eprintln!("{}", msg);
         return Err(msg);
@@ -229,4 +241,27 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcas
             expected_gas,
         },
     })
+}
+
+fn to_string<E: std::fmt::Debug>(e: E) -> String {
+    format!("{:?}", e)
+}
+
+pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
+    let mut parts = ProgramParts::default();
+    parts.code_and_jump_table = bytecode.into();
+    let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
+
+    let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+    disassembler.show_raw_bytes(false);
+    disassembler.prefer_non_abi_reg_names(true);
+    disassembler.prefer_unaliased(false);
+    disassembler.emit_header(false);
+    disassembler.emit_exports(false);
+
+    let mut disassembly = Vec::new();
+    disassembler.disassemble_into(&mut disassembly).map_err(to_string)?;
+    let disassembly = String::from_utf8(disassembly).map_err(to_string)?;
+
+    Ok(disassembly)
 }
