@@ -67,7 +67,7 @@ pub fn new_engine() -> Engine {
     Engine::new(&config).unwrap()
 }
 
-pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcase, ()> {
+pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcase, String> {
     let mut initial_regs = [0; 13];
     let mut initial_gas = 10000;
 
@@ -93,11 +93,13 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcas
     }
 
     let input = input_lines.join("\n");
+    println!("Input: {}", input);
     let blob = match assemble(&input) {
         Ok(blob) => blob,
         Err(error) => {
-            eprintln!("Failed to assemble {name:?}: {error}");
-            return Err(())
+            let msg = format!("Failed to assemble {name:?}: {error}");
+            eprintln!("{}", msg);
+            return Err(msg);
         }
     };
 
@@ -179,8 +181,9 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str) -> Result<Testcas
     }
 
     if final_pc.0 != expected_final_pc {
-        eprintln!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
-        return Err(())
+        let msg = format!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
+        eprintln!("{}", msg);
+        return Err(msg);
     }
 
     let mut expected_regs = Vec::new();
