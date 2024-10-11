@@ -228,7 +228,7 @@ macro_rules! emit {
 macro_rules! emit_branch {
     ($self:ident, $name:ident, $s1:ident, $s2:ident, $i:ident) => {
         let target_true = ProgramCounter($i);
-        if !$self.is_branch_valid(target_true) {
+        if !$self.module.is_jump_target_valid(target_true) {
             emit!($self, invalid_branch($self.program_counter));
         } else {
             let target_false = $self.next_program_counter();
@@ -348,7 +348,7 @@ impl InterpretedInstance {
     pub fn new_from_module(module: Module, force_step_tracing: bool) -> Self {
         let step_tracing = module.is_step_tracing() || force_step_tracing;
         let mut instance = Self {
-            compiled_offset_for_block: FlatMap::new(module.code_len()),
+            compiled_offset_for_block: FlatMap::new(module.code_len() + 1), // + 1 for one implicit out-of-bounds trap.
             compiled_handlers: Default::default(),
             compiled_args: Default::default(),
             module,
@@ -554,22 +554,14 @@ impl InterpretedInstance {
             || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
             || cfg!(test)
         {
-            if !self.step_tracing {
-                Ok(self.run_impl::<true, false>())
-            } else {
-                Ok(self.run_impl::<true, true>())
-            }
+            Ok(self.run_impl::<true>())
         } else {
-            if !self.step_tracing {
-                Ok(self.run_impl::<false, false>())
-            } else {
-                Ok(self.run_impl::<false, true>())
-            }
+            Ok(self.run_impl::<false>())
         }
     }
 
     #[inline(never)]
-    fn run_impl<const DEBUG: bool, const STEP_TRACING: bool>(&mut self) -> InterruptKind {
+    fn run_impl<const DEBUG: bool>(&mut self) -> InterruptKind {
         if !self.module.is_dynamic_paging() {
             self.basic_memory.mark_dirty();
         }
@@ -629,9 +621,9 @@ impl InterpretedInstance {
     }
 
     #[inline(always)]
-    fn pack_target(index: usize, is_first_in_basic_block: bool) -> NonZeroU32 {
+    fn pack_target(index: usize, is_jump_target_valid: bool) -> NonZeroU32 {
         let mut index = index as u32;
-        if is_first_in_basic_block {
+        if is_jump_target_valid {
             index |= 1 << 31;
         }
 
@@ -643,10 +635,61 @@ impl InterpretedInstance {
         ((value.get() >> 31) == 1, ((value.get() << 1) >> 1) as usize)
     }
 
+    /// Resolve a jump from *within* the program.
     fn resolve_jump<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
         if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
-            let (is_first, target) = Self::unpack_target(compiled_offset);
-            if !is_first {
+            let (is_jump_target_valid, target) = Self::unpack_target(compiled_offset);
+            if !is_jump_target_valid {
+                return None;
+            }
+
+            return Some(target);
+        }
+
+        if !self.module.is_jump_target_valid(program_counter) {
+            return None;
+        }
+
+        self.compile_block::<DEBUG>(program_counter)
+    }
+
+    /// Resolve a jump from *outside* of the program.
+    ///
+    /// Unlike jumps from within the program these can start execution anywhere to support suspend/resume of the VM.
+    fn resolve_arbitrary_jump<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
+        if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
+            let (_, target) = Self::unpack_target(compiled_offset);
+            return Some(target);
+        }
+
+        if DEBUG {
+            log::trace!("Resolving arbitrary jump: {program_counter}");
+        }
+
+        let basic_block_offset = match self.module.find_start_of_basic_block(program_counter) {
+            Some(offset) => {
+                log::trace!("  -> Found start of a basic block at: {offset}");
+                offset
+            }
+            None => {
+                if DEBUG {
+                    log::trace!("  -> Start of a basic block not found!");
+                }
+
+                return None;
+            }
+        };
+        self.compile_block::<DEBUG>(basic_block_offset)?;
+
+        let compiled_offset = self.compiled_offset_for_block.get(program_counter.0)?;
+        Some(Self::unpack_target(compiled_offset).1)
+    }
+
+    /// Resolve a fallthrough.
+    fn resolve_fallthrough<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
+        if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
+            let (is_jump_target_valid, target) = Self::unpack_target(compiled_offset);
+            if !is_jump_target_valid {
                 return None;
             }
 
@@ -656,26 +699,10 @@ impl InterpretedInstance {
         self.compile_block::<DEBUG>(program_counter)
     }
 
-    fn resolve_arbitrary_jump<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
-        if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
-            let (_, target) = Self::unpack_target(compiled_offset);
-            return Some(target);
-        }
-
-        self.compile_block::<DEBUG>(program_counter)
-    }
-
     #[inline(never)]
     #[cold]
     fn compile_block<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
-        let mut instructions = self.module.instructions_at(program_counter)?;
-
-        if program_counter.0 > 0
-            && !instructions
-                .clone()
-                .next_back()
-                .map_or(true, |instruction| instruction.starts_new_basic_block())
-        {
+        if program_counter.0 > self.module.code_len() {
             return None;
         }
 
@@ -686,14 +713,14 @@ impl InterpretedInstance {
 
         let mut gas_visitor = GasVisitor::default();
         let mut charge_gas_index = None;
-        let mut is_first = true;
-        let mut is_properly_terminated = false;
-        let mut last_program_counter = program_counter;
-        while let Some(instruction) = instructions.next() {
-            self.compiled_offset_for_block
-                .insert(instruction.offset.0, Self::pack_target(self.compiled_handlers.len(), is_first));
+        let mut is_jump_target_valid = self.module.is_jump_target_valid(program_counter);
+        for instruction in self.module.instructions_bounded_at(program_counter) {
+            self.compiled_offset_for_block.insert(
+                instruction.offset.0,
+                Self::pack_target(self.compiled_handlers.len(), is_jump_target_valid),
+            );
 
-            is_first = false;
+            is_jump_target_valid = false;
 
             if self.step_tracing {
                 if DEBUG {
@@ -718,51 +745,23 @@ impl InterpretedInstance {
                 log::debug!("  [{}]: {}: {}", self.compiled_handlers.len(), instruction.offset, instruction.kind);
             }
 
-            instruction.visit(&mut Compiler::<DEBUG, false> {
+            #[cfg(debug_assertions)]
+            let original_length = self.compiled_handlers.len();
+
+            instruction.visit(&mut Compiler::<DEBUG> {
                 program_counter: instruction.offset,
-                instruction_length: instruction.length,
+                next_program_counter: instruction.next_offset,
                 compiled_handlers: &mut self.compiled_handlers,
                 compiled_args: &mut self.compiled_args,
                 module: &self.module,
             });
 
-            last_program_counter = instruction.next_offset();
+            #[cfg(debug_assertions)]
+            debug_assert!(self.compiled_handlers.len() > original_length);
+
             if instruction.opcode().starts_new_basic_block() {
-                is_properly_terminated =
-                    instruction.opcode() != polkavm_common::program::Opcode::fallthrough || instructions.next().is_some();
                 break;
             }
-        }
-
-        if !is_properly_terminated {
-            let instruction = polkavm_common::program::ParsedInstruction {
-                kind: polkavm_common::program::Instruction::trap,
-                offset: last_program_counter,
-                length: 1,
-            };
-
-            if self.step_tracing {
-                if DEBUG {
-                    log::debug!("  [{}]: {}: step", self.compiled_handlers.len(), instruction.offset);
-                }
-                emit!(self, step(instruction.offset));
-            }
-
-            if DEBUG {
-                log::debug!("  [{}]: {}: trap (implicit)", self.compiled_handlers.len(), instruction.offset);
-            }
-
-            if self.module.gas_metering().is_some() {
-                instruction.visit(&mut gas_visitor);
-            }
-
-            instruction.visit(&mut Compiler::<DEBUG, false> {
-                program_counter: instruction.offset,
-                instruction_length: instruction.length,
-                compiled_handlers: &mut self.compiled_handlers,
-                compiled_args: &mut self.compiled_args,
-                module: &self.module,
-            });
         }
 
         if let Some((program_counter, index)) = charge_gas_index {
@@ -1665,7 +1664,7 @@ define_interpreter! {
         if new_gas < 0 {
             not_enough_gas_impl::<DEBUG>(visitor, program_counter, new_gas)
         } else {
-            log::debug!("Trap at {}: explicit trap", program_counter);
+            log::debug!("Trap at {}: out of range", program_counter);
 
             visitor.inner.gas = new_gas;
             trap_impl::<DEBUG>(visitor, program_counter)
@@ -1733,10 +1732,10 @@ define_interpreter! {
             log::trace!("[{}]: ecalli {hostcall_number}", visitor.inner.compiled_offset);
         }
 
-        let length = visitor.inner.module.instructions_at(program_counter).unwrap().next().unwrap().length;
+        let next_offset = visitor.inner.module.instructions_bounded_at(program_counter).next().unwrap().next_offset;
         visitor.inner.program_counter = program_counter;
         visitor.inner.program_counter_valid = true;
-        visitor.inner.next_program_counter = Some(ProgramCounter(program_counter.0 + length));
+        visitor.inner.next_program_counter = Some(next_offset);
         visitor.inner.next_program_counter_changed = true;
         visitor.inner.interrupt = InterruptKind::Ecalli(hostcall_number);
         None
@@ -2677,58 +2676,85 @@ define_interpreter! {
 
     fn unresolved_jump<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, jump_to: ProgramCounter) -> Option<Target> {
         if DEBUG {
-            log::trace!("[{}]: jump {jump_to}", visitor.inner.compiled_offset);
+            log::trace!("[{}]: unresolved jump {jump_to}", visitor.inner.compiled_offset);
         }
 
         if let Some(target) = visitor.inner.resolve_jump::<DEBUG>(jump_to) {
             let offset = visitor.inner.compiled_offset;
             if offset + 1 == target {
+                if DEBUG {
+                    log::trace!("  -> resolved to fallthrough");
+                }
                 visitor.inner.compiled_handlers[offset] = raw_handlers::fallthrough::<DEBUG> as Handler;
                 visitor.inner.compiled_args[offset] = Args::fallthrough();
             } else {
+                if DEBUG {
+                    log::trace!("  -> resolved to jump");
+                }
                 visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
                 visitor.inner.compiled_args[offset] = Args::jump(target);
             }
 
             Some(target)
         } else {
+            if DEBUG {
+                log::trace!("  -> resolved to trap");
+            }
             trap_impl::<DEBUG>(visitor, program_counter)
+        }
+    }
+
+    fn unresolved_fallthrough<const DEBUG: bool>(visitor: &mut Visitor, jump_to: ProgramCounter) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: unresolved fallthrough {jump_to}", visitor.inner.compiled_offset);
+        }
+
+        let offset = visitor.inner.compiled_offset;
+        if let Some(target) = visitor.inner.resolve_fallthrough::<DEBUG>(jump_to) {
+            if offset + 1 == target {
+                if DEBUG {
+                    log::trace!("  -> resolved to fallthrough");
+                }
+                visitor.inner.compiled_handlers[offset] = raw_handlers::fallthrough::<DEBUG> as Handler;
+                visitor.inner.compiled_args[offset] = Args::fallthrough();
+            } else {
+                if DEBUG {
+                    log::trace!("  -> resolved to jump");
+                }
+                visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
+                visitor.inner.compiled_args[offset] = Args::jump(target);
+            }
+
+            Some(target)
+        } else {
+            visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
+            visitor.inner.compiled_args[offset] = Args::jump(TARGET_OUT_OF_RANGE);
+            Some(TARGET_OUT_OF_RANGE)
         }
     }
 }
 
-struct Compiler<'a, const DEBUG: bool, const STEP_TRACING: bool> {
+struct Compiler<'a, const DEBUG: bool> {
     program_counter: ProgramCounter,
-    instruction_length: u32,
+    next_program_counter: ProgramCounter,
     compiled_handlers: &'a mut Vec<Handler>,
     compiled_args: &'a mut Vec<Args>,
     module: &'a Module,
 }
 
-impl<'a, const DEBUG: bool, const STEP_TRACING: bool> Compiler<'a, DEBUG, STEP_TRACING> {
+impl<'a, const DEBUG: bool> Compiler<'a, DEBUG> {
     fn next_program_counter(&self) -> ProgramCounter {
-        ProgramCounter(self.program_counter.0 + self.instruction_length)
-    }
-
-    fn is_branch_valid(&mut self, target: ProgramCounter) -> bool {
-        let Some(mut instructions) = self.module.instructions_at(target) else {
-            log::debug!("  invalid branch to {target}: out of range offset");
-            return false;
-        };
-
-        if let Some(previous_instruction) = instructions.next_back() {
-            if !previous_instruction.starts_new_basic_block() {
-                log::debug!("  invalid branch to {target}: previous insruction doesn't start an new basic block");
-                return false;
-            }
-        }
-
-        true
+        self.next_program_counter
     }
 }
 
-impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Compiler<'a, DEBUG, STEP_TRACING> {
+impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     type ReturnTy = ();
+
+    #[cold]
+    fn invalid(&mut self) -> Self::ReturnTy {
+        self.trap();
+    }
 
     fn trap(&mut self) -> Self::ReturnTy {
         emit!(self, trap(self.program_counter));
@@ -2736,7 +2762,7 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
         let target = self.next_program_counter();
-        emit!(self, unresolved_jump(self.program_counter, target));
+        emit!(self, unresolved_fallthrough(target));
     }
 
     fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
@@ -2755,6 +2781,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, set_less_than_signed(d, s1, s2));
     }
 
+    fn set_less_than_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_less_than_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, shift_logical_right(d, s1, s2));
     }
@@ -2765,6 +2799,18 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, shift_logical_left(d, s1, s2));
+    }
+
+    fn shift_logical_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_arithmetic_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_logical_left_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
     }
 
     fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2779,12 +2825,32 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, or(d, s1, s2));
     }
 
+    fn xor_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn and_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn or_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, add(d, s1, s2));
     }
 
+    fn add_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, sub(d, s1, s2));
+    }
+
+    fn sub_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
     }
 
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2795,8 +2861,36 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, mul(d, s1, s2));
     }
 
+    fn mul_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, mul_imm(d, s1, s2));
+    }
+
+    fn mul_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn mul_upper_signed_signed_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+
+    fn mul_upper_unsigned_unsigned_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+
+    fn mul_upper_signed_signed_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+
+    fn mul_upper_unsigned_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+
+    fn mul_upper_signed_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2835,6 +2929,22 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, rem_signed(d, s1, s2));
     }
 
+    fn div_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn div_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn rem_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn rem_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, set_less_than_unsigned_imm(d, s1, s2));
     }
@@ -2849,6 +2959,22 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, set_greater_than_signed_imm(d, s1, s2));
+    }
+
+    fn set_less_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_greater_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_less_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_greater_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2875,6 +3001,30 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, shift_logical_left_imm_alt(d, s2, s1));
     }
 
+    fn shift_logical_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_logical_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_arithmetic_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_arithmetic_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_logical_left_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn shift_logical_left_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, or_imm(d, s1, s2));
     }
@@ -2885,6 +3035,18 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, xor_imm(d, s1, s2));
+    }
+
+    fn or_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn and_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn xor_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {
@@ -2909,6 +3071,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         emit!(self, cmov_if_not_zero_imm(d, c, s));
+    }
+
+    fn add_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2939,6 +3105,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, store_imm_indirect_u8_basic(self.program_counter, base, offset, value));
@@ -2961,6 +3131,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, store_imm_indirect_u32_dynamic(self.program_counter, base, offset, value));
         }
+    }
+
+    fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -2987,6 +3161,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, store_u8_basic(self.program_counter, src, offset));
@@ -3009,6 +3187,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, store_u32_dynamic(self.program_counter, src, offset));
         }
+    }
+
+    fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3051,6 +3233,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn load_u64(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, load_indirect_u8_basic(self.program_counter, dst, base, offset));
@@ -3089,6 +3279,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, load_indirect_u32_dynamic(self.program_counter, dst, base, offset));
         }
+    }
+
+    fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
