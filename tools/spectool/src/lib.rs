@@ -67,13 +67,7 @@ pub fn new_engine() -> Engine {
     Engine::new(&config).unwrap()
 }
 
-pub fn prepare_input(
-    input: &str,
-    engine: &Engine,
-    name: &str,
-    execute: bool,
-) -> Result<Testcase, String> {
-
+pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) -> Result<Testcase, String> {
     let mut pre = PrePost::default();
     let mut post = PrePost::default();
 
@@ -198,9 +192,10 @@ pub fn prepare_input(
                     continue;
                 }
             }
-        }} else {
-            "halt"
-        };
+        }
+    } else {
+        "halt"
+    };
 
     if expected_status != "halt" {
         final_pc = instance.program_counter().unwrap();
@@ -236,7 +231,6 @@ pub fn prepare_input(
     let mut disassembly = Vec::new();
     disassembler.disassemble_into(&mut disassembly).unwrap();
     let disassembly = String::from_utf8(disassembly).unwrap();
-
 
     Ok(Testcase {
         disassembly,
@@ -308,7 +302,8 @@ pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
     parts.code_and_jump_table = bytecode.into();
     let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
 
-    let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+    let mut disassembler =
+        polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
     disassembler.show_raw_bytes(false);
     disassembler.prefer_non_abi_reg_names(true);
     disassembler.prefer_unaliased(false);

@@ -4,9 +4,9 @@
 #![allow(clippy::use_debug)]
 
 use clap::Parser;
-use spectool::{prepare_input, Testcase};
 use core::fmt::Write;
 use polkavm::{Engine, Reg};
+use spectool::{prepare_input, Testcase};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]

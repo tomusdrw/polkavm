@@ -20,7 +20,7 @@ mod tests {
 
     use crate::compile_assembly;
 
-const ASSEMBLY: &'static str = r#"
+    const ASSEMBLY: &'static str = r#"
 pre: a0 = 9
 pre: ra = 0xffff0000
 
@@ -57,14 +57,16 @@ pub @expected_exit:
 
     #[test]
     fn should_compile_other_assembly() {
-        let result = compile_assembly(r#"@block0:
+        let result = compile_assembly(
+            r#"@block0:
 	r7 = 0x4d2
 	jump @block2 if r7 == 1235
 @block1:
 	trap
 @block2:
 	r7 = 0xdeadbeef
-"#);
+"#,
+        );
         assert!(result.is_ok());
     }
 
