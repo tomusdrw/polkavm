@@ -145,8 +145,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
 
     let initial_pc = blob.exports()
         .find(|export| export.symbol() == "main")
-        .map(|x| x.program_counter())
-        .unwrap_or(ProgramCounter(0));
+        .map_or(ProgramCounter(0), |x| x.program_counter());
 
     let expected_final_pc = if let Some(export) = blob.exports().find(|export| export.symbol() == "expected_exit") {
         assert!(
