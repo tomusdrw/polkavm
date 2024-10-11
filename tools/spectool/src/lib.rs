@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::use_debug)]
 
-use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, Reg};
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, Reg};
 use polkavm_common::assembler::assemble;
 use polkavm_common::program::ProgramParts;
 
@@ -143,7 +143,10 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
         });
     }
 
-    let initial_pc = blob.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
+    let initial_pc = blob.exports()
+        .find(|export| export.symbol() == "main")
+        .map(|x| x.program_counter())
+        .unwrap_or(ProgramCounter(0));
 
     let expected_final_pc = if let Some(export) = blob.exports().find(|export| export.symbol() == "expected_exit") {
         assert!(
