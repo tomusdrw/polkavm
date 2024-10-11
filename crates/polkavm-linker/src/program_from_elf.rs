@@ -1,5 +1,7 @@
 use polkavm_common::abi::{MemoryMapBuilder, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
-use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramCounter, ProgramSymbol};
+use polkavm_common::program::{
+    self, FrameKind, Instruction, InstructionSet, LineProgramOp, Opcode, ProgramBlob, ProgramCounter, ProgramSymbol,
+};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -36,6 +38,39 @@ enum Reg {
     E0 = 13,
     E1 = 14,
     E2 = 15,
+}
+
+impl From<polkavm_common::program::Reg> for Reg {
+    fn from(reg: polkavm_common::program::Reg) -> Reg {
+        use polkavm_common::program::Reg as R;
+        match reg {
+            R::RA => Reg::RA,
+            R::SP => Reg::SP,
+            R::T0 => Reg::T0,
+            R::T1 => Reg::T1,
+            R::T2 => Reg::T2,
+            R::S0 => Reg::S0,
+            R::S1 => Reg::S1,
+            R::A0 => Reg::A0,
+            R::A1 => Reg::A1,
+            R::A2 => Reg::A2,
+            R::A3 => Reg::A3,
+            R::A4 => Reg::A4,
+            R::A5 => Reg::A5,
+        }
+    }
+}
+
+impl From<polkavm_common::program::RawReg> for Reg {
+    fn from(reg: polkavm_common::program::RawReg) -> Reg {
+        reg.get().into()
+    }
+}
+
+impl From<polkavm_common::program::RawReg> for RegImm {
+    fn from(reg: polkavm_common::program::RawReg) -> RegImm {
+        RegImm::Reg(reg.get().into())
+    }
 }
 
 impl Reg {
@@ -351,6 +386,16 @@ impl core::fmt::Debug for SectionTarget {
     }
 }
 
+impl From<SectionTarget> for SectionIndex {
+    fn from(target: SectionTarget) -> Self {
+        target.section_index
+    }
+}
+
+fn i32_to_i64(x: i32) -> i64 {
+    i64::from(x)
+}
+
 fn extract_delimited<'a>(str: &mut &'a str, prefix: &str, suffix: &str) -> Option<(&'a str, &'a str)> {
     let original = *str;
     let start_of_prefix = str.find(prefix)?;
@@ -368,11 +413,17 @@ fn test_extract_delimited() {
 }
 
 impl SectionTarget {
-    fn fmt_human_readable(&self, elf: &Elf) -> String {
+    fn fmt_human_readable<H>(&self, elf: &Elf<H>) -> String
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         Self::make_human_readable_in_debug_string(elf, &self.to_string())
     }
 
-    fn make_human_readable_in_debug_string(elf: &Elf, mut str: &str) -> String {
+    fn make_human_readable_in_debug_string<H>(elf: &Elf<H>, mut str: &str) -> String
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         // A hack-ish way to make nested `Debug` error messages more readable by replacing
         // raw section indexes and offsets with a more human readable string.
 
@@ -432,6 +483,14 @@ impl SectionTarget {
         SectionTarget {
             section_index: self.section_index,
             offset: u64::from(cb(offset as i32) as u32),
+        }
+    }
+
+    fn map_offset_i64(self, cb: impl FnOnce(i64) -> i64) -> Self {
+        let offset = self.offset as i64;
+        SectionTarget {
+            section_index: self.section_index,
+            offset: cb(offset) as u64,
         }
     }
 }
@@ -522,6 +581,10 @@ enum BasicInst<T> {
         dst: Reg,
         imm: i32,
     },
+    MoveReg {
+        dst: Reg,
+        src: Reg,
+    },
     RegReg {
         kind: RegRegKind,
         dst: Reg,
@@ -560,18 +623,7 @@ enum OpKind {
 impl<T> BasicInst<T> {
     fn is_nop(&self) -> bool {
         match self {
-            BasicInst::AnyAny {
-                kind: AnyAnyKind::Add,
-                dst,
-                src1,
-                src2,
-            } => {
-                if RegImm::Reg(*dst) == *src1 && *src2 == RegImm::Imm(0) {
-                    return true;
-                }
-
-                false
-            }
+            BasicInst::MoveReg { dst, src } => dst == src,
             BasicInst::Nop => true,
             _ => false,
         }
@@ -584,6 +636,7 @@ impl<T> BasicInst<T> {
             | BasicInst::LoadAbsolute { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. } => RegMask::empty(),
+            BasicInst::MoveReg { src, .. } => RegMask::from(src),
             BasicInst::StoreAbsolute { src, .. } => RegMask::from(src),
             BasicInst::LoadIndirect { base, .. } => RegMask::from(base),
             BasicInst::StoreIndirect { src, base, .. } => RegMask::from(src) | RegMask::from(base),
@@ -598,7 +651,8 @@ impl<T> BasicInst<T> {
     fn dst_mask(&self, imports: &[Import]) -> RegMask {
         match *self {
             BasicInst::Nop | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => RegMask::empty(),
-            BasicInst::LoadImmediate { dst, .. }
+            BasicInst::MoveReg { dst, .. }
+            | BasicInst::LoadImmediate { dst, .. }
             | BasicInst::LoadAbsolute { dst, .. }
             | BasicInst::LoadAddress { dst, .. }
             | BasicInst::LoadAddressIndirect { dst, .. }
@@ -616,6 +670,7 @@ impl<T> BasicInst<T> {
             BasicInst::Sbrk { .. } | BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
             BasicInst::Nop
+            | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. }
@@ -674,6 +729,10 @@ impl<T> BasicInst<T> {
                 src2: src2.map_register(|reg| map(reg, OpKind::Read)),
                 dst: map(dst, OpKind::Write),
             }),
+            BasicInst::MoveReg { dst, src } => Some(BasicInst::MoveReg {
+                src: map(src, OpKind::Read),
+                dst: map(dst, OpKind::Write),
+            }),
             BasicInst::Cmov { kind, dst, src, cond } => Some(BasicInst::Cmov {
                 kind,
                 src: src.map_register(|reg| map(reg, OpKind::Read)),
@@ -706,6 +765,8 @@ impl<T> BasicInst<T> {
             .is_none();
 
         if is_special_instruction {
+            assert_eq!(length, 0);
+
             let BasicInst::Ecalli { nth_import } = *self else { unreachable!() };
             let import = &imports[nth_import];
 
@@ -736,6 +797,7 @@ impl<T> BasicInst<T> {
 
     fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<BasicInst<U>, E> {
         Ok(match self {
+            BasicInst::MoveReg { dst, src } => BasicInst::MoveReg { dst, src },
             BasicInst::LoadImmediate { dst, imm } => BasicInst::LoadImmediate { dst, imm },
             BasicInst::LoadAbsolute { kind, dst, target } => BasicInst::LoadAbsolute { kind, dst, target },
             BasicInst::StoreAbsolute { kind, src, target } => BasicInst::StoreAbsolute { kind, src, target },
@@ -760,6 +822,7 @@ impl<T> BasicInst<T> {
             BasicInst::LoadAbsolute { target, .. } | BasicInst::StoreAbsolute { target, .. } => (Some(*target), None),
             BasicInst::LoadAddress { target, .. } | BasicInst::LoadAddressIndirect { target, .. } => (None, Some(*target)),
             BasicInst::Nop
+            | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadIndirect { .. }
             | BasicInst::StoreIndirect { .. }
@@ -868,6 +931,27 @@ impl<T> ControlInst<T> {
             ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => [None, None],
         }
     }
+
+    fn fallthrough_target(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        match self {
+            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => None,
+            ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => Some(*target),
+        }
+    }
+
+    fn fallthrough_target_mut(&mut self) -> Option<&mut T> {
+        match self {
+            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => None,
+            ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => Some(target),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -879,6 +963,18 @@ enum InstExt<BasicT, ControlT> {
 impl<BasicT, ControlT> InstExt<BasicT, ControlT> {
     fn nop() -> Self {
         InstExt::Basic(BasicInst::Nop)
+    }
+}
+
+impl<BasicT, ControlT> From<BasicInst<BasicT>> for InstExt<BasicT, ControlT> {
+    fn from(inst: BasicInst<BasicT>) -> Self {
+        InstExt::Basic(inst)
+    }
+}
+
+impl<BasicT, ControlT> From<ControlInst<ControlT>> for InstExt<BasicT, ControlT> {
+    fn from(inst: ControlInst<ControlT>) -> Self {
+        InstExt::Control(inst)
     }
 }
 
@@ -988,13 +1084,16 @@ fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
     }
 }
 
-fn process_sections(
-    elf: &Elf,
+fn process_sections<H>(
+    elf: &Elf<H>,
     current_address: &mut u64,
     chunks: &mut Vec<DataRef>,
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
     sections: impl IntoIterator<Item = SectionIndex>,
-) -> u64 {
+) -> u64
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     for section_index in sections {
         let section = elf.section_by_index(section_index);
         assert!(section.size() >= section.data().len() as u64);
@@ -1046,14 +1145,17 @@ fn process_sections(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_memory_config(
-    elf: &Elf,
+fn extract_memory_config<H>(
+    elf: &Elf<H>,
     sections_ro_data: &[SectionIndex],
     sections_rw_data: &[SectionIndex],
     sections_bss: &[SectionIndex],
     sections_min_stack_size: &[SectionIndex],
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
-) -> Result<MemoryConfig, ProgramFromElfError> {
+) -> Result<MemoryConfig, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut current_address = u64::from(VM_MAX_PAGE_SIZE);
 
     let mut ro_data = Vec::new();
@@ -1144,11 +1246,14 @@ struct Export {
     metadata: ExternMetadata,
 }
 
-fn extract_exports(
-    elf: &Elf,
+fn extract_exports<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     section: &Section,
-) -> Result<Vec<Export>, ProgramFromElfError> {
+) -> Result<Vec<Export>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let mut exports = Vec::new();
     loop {
@@ -1168,7 +1273,9 @@ fn extract_exports(
             };
 
             // Ignore the address as written; we'll just use the relocations instead.
-            if let Err(error) = b.read_u32() {
+            let error = if elf.is_64() { b.read_u64().err() } else { b.read_u32().err() };
+
+            if let Some(error) = error {
                 return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
             }
 
@@ -1178,14 +1285,20 @@ fn extract_exports(
                 )));
             };
 
-            let RelocationKind::Abs {
-                target,
-                size: RelocationSize::U32,
-            } = relocation
-            else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an export with an unexpected relocation at {location}: {relocation:?}"
-                )));
+            let target = match relocation {
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U64,
+                } if elf.is_64() => target,
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } if !elf.is_64() => target,
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "found an export with an unexpected relocation at {location}: {relocation:?}"
+                    )));
+                }
             };
 
             parse_extern_metadata(elf, relocations, *target)?
@@ -1197,7 +1310,9 @@ fn extract_exports(
         };
 
         // Ignore the address as written; we'll just use the relocations instead.
-        if let Err(error) = b.read_u32() {
+        let error = if elf.is_64() { b.read_u64().err() } else { b.read_u32().err() };
+
+        if let Some(error) = error {
             return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
         }
 
@@ -1207,14 +1322,20 @@ fn extract_exports(
             )));
         };
 
-        let RelocationKind::Abs {
-            target,
-            size: RelocationSize::U32,
-        } = relocation
-        else {
-            return Err(ProgramFromElfError::other(format!(
-                "found an export with an unexpected relocation at {location}: {relocation:?}"
-            )));
+        let target = match relocation {
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U64,
+            } if elf.is_64() => target,
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U32,
+            } if !elf.is_64() => target,
+            _ => {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an export with an unexpected relocation at {location}: {relocation:?}"
+                )));
+            }
         };
 
         exports.push(Export {
@@ -1272,11 +1393,14 @@ impl Import {
     }
 }
 
-fn parse_extern_metadata_impl(
-    elf: &Elf,
+fn parse_extern_metadata_impl<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     target: SectionTarget,
-) -> Result<ExternMetadata, String> {
+) -> Result<ExternMetadata, String>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let section = elf.section_by_index(target.section_index);
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let _ = b.read(target.offset as usize)?;
@@ -1296,14 +1420,22 @@ fn parse_extern_metadata_impl(
     };
 
     // Ignore the address as written; we'll just use the relocations instead.
-    b.read_u32()?;
+    if elf.is_64() {
+        b.read_u64()?;
+    } else {
+        b.read_u32()?;
+    };
 
-    let RelocationKind::Abs {
-        target: symbol_location,
-        size: RelocationSize::U32,
-    } = symbol_relocation
-    else {
-        return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
+    let symbol_location = match symbol_relocation {
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U64,
+        } if elf.is_64() => target,
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U32,
+        } if !elf.is_64() => target,
+        _ => return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}")),
     };
 
     let Some(symbol) = elf
@@ -1348,11 +1480,14 @@ fn parse_extern_metadata_impl(
     })
 }
 
-fn parse_extern_metadata(
-    elf: &Elf,
+fn parse_extern_metadata<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     target: SectionTarget,
-) -> Result<ExternMetadata, ProgramFromElfError> {
+) -> Result<ExternMetadata, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     parse_extern_metadata_impl(elf, relocations, target)
         .map_err(|error| ProgramFromElfError::other(format!("failed to parse extern metadata: {}", error)))
 }
@@ -1430,9 +1565,18 @@ fn check_imports_and_assign_indexes(imports: &mut Vec<Import>, used_imports: &Ha
     Ok(())
 }
 
-fn get_relocation_target(elf: &Elf, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError> {
+fn get_relocation_target<H>(elf: &Elf<H>, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     match relocation.target() {
         object::RelocationTarget::Absolute => {
+            if let object::RelocationFlags::Elf { r_type } = relocation.flags() {
+                if r_type == object::elf::R_RISCV_NONE {
+                    // GNU ld apparently turns R_RISCV_ALIGN and R_RISCV_RELAX into these.
+                    return Ok(None);
+                }
+            }
             // Example of such relocation:
             //   Offset     Info    Type                Sym. Value  Symbol's Name + Addend
             //   00060839  00000001 R_RISCV_32                        0
@@ -1483,6 +1627,11 @@ enum MinMax {
     MinSigned,
     MaxUnsigned,
     MinUnsigned,
+
+    MaxSigned64,
+    MinSigned64,
+    MaxUnsigned64,
+    MinUnsigned64,
 }
 
 fn emit_minmax(
@@ -1508,6 +1657,11 @@ fn emit_minmax(
         MinMax::MaxUnsigned => (src2, src1, AnyAnyKind::SetLessThanUnsigned),
         MinMax::MinSigned => (src1, src2, AnyAnyKind::SetLessThanSigned),
         MinMax::MaxSigned => (src2, src1, AnyAnyKind::SetLessThanSigned),
+
+        MinMax::MinUnsigned64 => (src1, src2, AnyAnyKind::SetLessThanUnsigned64),
+        MinMax::MaxUnsigned64 => (src2, src1, AnyAnyKind::SetLessThanUnsigned64),
+        MinMax::MinSigned64 => (src1, src2, AnyAnyKind::SetLessThanSigned64),
+        MinMax::MaxSigned64 => (src2, src1, AnyAnyKind::SetLessThanSigned64),
     };
 
     emit(InstExt::Basic(BasicInst::AnyAny {
@@ -1518,12 +1672,7 @@ fn emit_minmax(
     }));
 
     if let Some(src1) = src1 {
-        emit(InstExt::Basic(BasicInst::AnyAny {
-            kind: AnyAnyKind::Add,
-            dst,
-            src1: RegImm::Reg(src1),
-            src2: RegImm::Imm(0),
-        }));
+        emit(InstExt::Basic(BasicInst::MoveReg { dst, src: src1 }));
     } else {
         emit(InstExt::Basic(BasicInst::LoadImmediate { dst: tmp, imm: 0 }));
     }
@@ -1541,11 +1690,16 @@ fn convert_instruction(
     current_location: SectionTarget,
     instruction: Inst,
     instruction_size: u64,
+    rv64: bool,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
         Inst::LoadUpperImmediate { dst, value } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
+
             emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: value as i32 }));
             Ok(())
         }
@@ -1650,30 +1804,64 @@ fn convert_instruction(
             Ok(())
         }
         Inst::RegImm { kind, dst, src, imm } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
+
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
+                RegImmKind::Add64 => AnyAnyKind::Add64,
                 RegImmKind::And => AnyAnyKind::And,
+                RegImmKind::And64 => AnyAnyKind::And64,
                 RegImmKind::Or => AnyAnyKind::Or,
+                RegImmKind::Or64 => AnyAnyKind::Or64,
                 RegImmKind::Xor => AnyAnyKind::Xor,
+                RegImmKind::Xor64 => AnyAnyKind::Xor64,
                 RegImmKind::SetLessThanUnsigned => AnyAnyKind::SetLessThanUnsigned,
+                RegImmKind::SetLessThanUnsigned64 => AnyAnyKind::SetLessThanUnsigned64,
                 RegImmKind::SetLessThanSigned => AnyAnyKind::SetLessThanSigned,
+                RegImmKind::SetLessThanSigned64 => AnyAnyKind::SetLessThanSigned64,
                 RegImmKind::ShiftLogicalLeft => AnyAnyKind::ShiftLogicalLeft,
+                RegImmKind::ShiftLogicalLeft64 => AnyAnyKind::ShiftLogicalLeft64,
                 RegImmKind::ShiftLogicalRight => AnyAnyKind::ShiftLogicalRight,
+                RegImmKind::ShiftLogicalRight64 => AnyAnyKind::ShiftLogicalRight64,
                 RegImmKind::ShiftArithmeticRight => AnyAnyKind::ShiftArithmeticRight,
+                RegImmKind::ShiftArithmeticRight64 => AnyAnyKind::ShiftArithmeticRight64,
             };
 
-            emit(InstExt::Basic(BasicInst::AnyAny {
-                kind,
-                dst,
-                src1: src,
-                src2: (imm as u32).into(),
-            }));
+            match src {
+                RegImm::Imm(0) => {
+                    // The optimizer can take care of this later, but doing it early here is more efficient.
+                    emit(InstExt::Basic(BasicInst::LoadImmediate {
+                        dst,
+                        imm: OperationKind::from(kind)
+                            .apply_const(0, i32_to_i64(imm))
+                            .try_into()
+                            .expect("load immediate overflow"),
+                    }));
+                }
+                RegImm::Reg(src) if imm == 0 && ((!rv64 && kind == AnyAnyKind::Add) || (rv64 && kind == AnyAnyKind::Add64)) => {
+                    emit(InstExt::Basic(BasicInst::MoveReg { dst, src }));
+                }
+                _ => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind,
+                        dst,
+                        src1: src,
+                        src2: (imm as u32).into(),
+                    }));
+                }
+            }
+
             Ok(())
         }
         Inst::RegReg { kind, dst, src1, src2 } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
 
             macro_rules! anyany {
                 ($kind:ident) => {
@@ -1695,11 +1883,27 @@ fn convert_instruction(
                             src1,
                             src2,
                         },
-                        _ => {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a {:?} instruction using a zero register",
-                                kind
-                            )))
+                        (lhs, rhs) => {
+                            let lhs = lhs
+                                .map(|reg| RegValue::InputReg(reg, BlockTarget::from_raw(0)))
+                                .unwrap_or(RegValue::Constant(0));
+
+                            let rhs = rhs
+                                .map(|reg| RegValue::InputReg(reg, BlockTarget::from_raw(0)))
+                                .unwrap_or(RegValue::Constant(0));
+
+                            match OperationKind::from(RegRegKind::$kind).apply(lhs, rhs) {
+                                Some(RegValue::Constant(imm)) => {
+                                    let imm: i32 = imm.try_into().expect("immediate operand overflow");
+                                    BasicInst::LoadImmediate { dst, imm }
+                                }
+                                _ => {
+                                    return Err(ProgramFromElfError::other(format!(
+                                        "found a {:?} instruction using a zero register",
+                                        kind
+                                    )))
+                                }
+                            }
                         }
                     }
                 };
@@ -1708,24 +1912,42 @@ fn convert_instruction(
             use crate::riscv::RegRegKind as K;
             let instruction = match kind {
                 K::Add => anyany!(Add),
+                K::Add64 => anyany!(Add64),
                 K::Sub => anyany!(Sub),
+                K::Sub64 => anyany!(Sub64),
                 K::And => anyany!(And),
+                K::And64 => anyany!(And64),
                 K::Or => anyany!(Or),
+                K::Or64 => anyany!(Or64),
                 K::Xor => anyany!(Xor),
+                K::Xor64 => anyany!(Xor64),
                 K::SetLessThanUnsigned => anyany!(SetLessThanUnsigned),
+                K::SetLessThanUnsigned64 => anyany!(SetLessThanUnsigned64),
                 K::SetLessThanSigned => anyany!(SetLessThanSigned),
+                K::SetLessThanSigned64 => anyany!(SetLessThanSigned64),
                 K::ShiftLogicalLeft => anyany!(ShiftLogicalLeft),
+                K::ShiftLogicalLeft64 => anyany!(ShiftLogicalLeft64),
                 K::ShiftLogicalRight => anyany!(ShiftLogicalRight),
+                K::ShiftLogicalRight64 => anyany!(ShiftLogicalRight64),
                 K::ShiftArithmeticRight => anyany!(ShiftArithmeticRight),
+                K::ShiftArithmeticRight64 => anyany!(ShiftArithmeticRight64),
                 K::Mul => anyany!(Mul),
+                K::Mul64 => anyany!(Mul64),
                 K::MulUpperSignedSigned => anyany!(MulUpperSignedSigned),
+                K::MulUpperSignedSigned64 => anyany!(MulUpperSignedSigned64),
                 K::MulUpperUnsignedUnsigned => anyany!(MulUpperUnsignedUnsigned),
+                K::MulUpperUnsignedUnsigned64 => anyany!(MulUpperUnsignedUnsigned64),
 
                 K::MulUpperSignedUnsigned => regreg!(MulUpperSignedUnsigned),
+                K::MulUpperSignedUnsigned64 => regreg!(MulUpperSignedUnsigned64),
                 K::Div => regreg!(Div),
+                K::Div64 => regreg!(Div64),
                 K::DivUnsigned => regreg!(DivUnsigned),
+                K::DivUnsigned64 => regreg!(DivUnsigned64),
                 K::Rem => regreg!(Rem),
+                K::Rem64 => regreg!(Rem64),
                 K::RemUnsigned => regreg!(RemUnsigned),
+                K::RemUnsigned64 => regreg!(RemUnsigned64),
             };
 
             emit(InstExt::Basic(instruction));
@@ -1773,7 +1995,29 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
+                dst,
+                base: src,
+                offset: 0,
+            }));
+
+            Ok(())
+        }
+        Inst::LoadReserved64 { dst, src, .. } if rv64 => {
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the destination",
+                ));
+            };
+
+            let Some(src) = cast_reg_non_zero(src)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the source",
+                ));
+            };
+
+            emit(InstExt::Basic(BasicInst::LoadIndirect {
+                kind: LoadKind::U64,
                 dst,
                 base: src,
                 offset: 0,
@@ -1802,6 +2046,31 @@ fn convert_instruction(
             }
 
             Ok(())
+        }
+        Inst::StoreConditional64 { src, addr, dst, .. } if rv64 => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic store with a zero register as the address",
+                ));
+            };
+
+            let src = cast_reg_any(src)?;
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: StoreKind::U64,
+                src,
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(dst) = cast_reg_non_zero(dst)? {
+                // The store always succeeds, so write zero here.
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+            }
+
+            Ok(())
+        }
+        Inst::LoadReserved64 { .. } | Inst::StoreConditional64 { .. } => {
+            Err(ProgramFromElfError::other("found a 64bit instruction in a 32bit binary"))
         }
         Inst::Atomic {
             kind,
@@ -1832,6 +2101,14 @@ fn convert_instruction(
             }));
 
             match kind {
+                AtomicKind::Swap64 => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Add64,
+                        dst: new_value,
+                        src1: operand_regimm,
+                        src2: RegImm::Imm(0),
+                    }));
+                }
                 AtomicKind::Swap => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
@@ -1840,9 +2117,25 @@ fn convert_instruction(
                         src2: RegImm::Imm(0),
                     }));
                 }
+                AtomicKind::Add64 => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Add64,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Add => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::And64 => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::And64,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1856,9 +2149,25 @@ fn convert_instruction(
                         src2: operand_regimm,
                     }));
                 }
+                AtomicKind::Or64 => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Or64,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Or => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Or,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::Xor64 => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Xor64,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1884,6 +2193,19 @@ fn convert_instruction(
                 AtomicKind::MinUnsigned => {
                     emit_minmax(MinMax::MinUnsigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
                 }
+
+                AtomicKind::MaxSigned64 => {
+                    emit_minmax(MinMax::MaxSigned64, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinSigned64 => {
+                    emit_minmax(MinMax::MinSigned64, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MaxUnsigned64 => {
+                    emit_minmax(MinMax::MaxUnsigned64, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinUnsigned64 => {
+                    emit_minmax(MinMax::MinUnsigned64, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
             }
 
             emit(InstExt::Basic(BasicInst::StoreIndirect {
@@ -1894,11 +2216,9 @@ fn convert_instruction(
             }));
 
             if let Some(output) = output {
-                emit(InstExt::Basic(BasicInst::AnyAny {
-                    kind: AnyAnyKind::Add,
+                emit(InstExt::Basic(BasicInst::MoveReg {
                     dst: output,
-                    src1: old_value.into(),
-                    src2: RegImm::Imm(0),
+                    src: old_value,
                 }));
             }
 
@@ -1938,14 +2258,17 @@ fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
     }
 }
 
-fn parse_code_section(
-    elf: &Elf,
+fn parse_code_section<H>(
+    elf: &Elf<H>,
     section: &Section,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     imports: &mut Vec<Import>,
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let section_index = section.index();
     let section_name = section.name();
     let text = &section.data();
@@ -1971,14 +2294,15 @@ fn parse_code_section(
 
         if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
+            let pointer_size = if elf.is_64() { 8 } else { 4 };
 
-            // `ret` can be 2 bytes long, so 4 + 4 + 2 = 10
-            if relative_offset + 10 > text.len() {
+            // `ret` can be 2 bytes long, so (on 32-bit): 4 (ecalli) + 4 (pointer) + 2 (ret) = 10
+            if relative_offset + pointer_size + 6 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
             let target_location = current_location.add(4);
-            relative_offset += 8;
+            relative_offset += 4 + pointer_size;
 
             let Some(relocation) = relocations.get(&target_location) else {
                 return Err(ProgramFromElfError::other(format!(
@@ -1986,14 +2310,20 @@ fn parse_code_section(
                 )));
             };
 
-            let RelocationKind::Abs {
-                target: metadata_location,
-                size: RelocationSize::U32,
-            } = relocation
-            else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an external call with an unexpected relocation at {current_location}"
-                )));
+            let metadata_location = match relocation {
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U64,
+                } if elf.is_64() => target,
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } if !elf.is_64() => target,
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "found an external call with an unexpected relocation at {current_location}: {relocation:?}"
+                    )));
+                }
             };
 
             let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
@@ -2016,7 +2346,7 @@ fn parse_code_section(
 
             let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
 
-            if Inst::decode(next_raw_inst) != Some(INST_RET) {
+            if Inst::decode(next_raw_inst, elf.is_64()) != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
@@ -2064,7 +2394,7 @@ fn parse_code_section(
 
         relative_offset += inst_size as usize;
 
-        let Some(original_inst) = Inst::decode(raw_inst) else {
+        let Some(original_inst) = Inst::decode(raw_inst, elf.is_64()) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
                 section: section.name().into(),
                 offset: current_location.offset,
@@ -2085,7 +2415,7 @@ fn parse_code_section(
             {
                 if relative_offset < text.len() {
                     let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
-                    let next_inst = Inst::decode(next_inst);
+                    let next_inst = Inst::decode(next_inst, elf.is_64());
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
                         if base == ra_dst && base == base_upper {
@@ -2116,28 +2446,40 @@ fn parse_code_section(
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, inst_size, |inst| {
+            convert_instruction(section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
                 output.push((source, inst));
             })?;
 
             // We need to always emit at least one instruction (even if it's a NOP) to handle potential jumps.
-            assert_ne!(output.len(), original_length, "internal error: no instructions were emitted");
+            assert_ne!(
+                output.len(),
+                original_length,
+                "internal error: no instructions were emitted for instruction {original_inst:?} in section {section_name}"
+            );
         }
     }
 
     Ok(())
 }
 
-fn split_code_into_basic_blocks(
-    elf: &Elf,
+fn split_code_into_basic_blocks<H>(
+    elf: &Elf<H>,
     jump_targets: &HashSet<SectionTarget>,
     instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
-) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError> {
+) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
+    #[cfg(test)]
+    let _ = elf;
+
     let mut blocks: Vec<BasicBlock<SectionTarget, SectionTarget>> = Vec::new();
     let mut current_block: Vec<(SourceStack, BasicInst<SectionTarget>)> = Vec::new();
     let mut block_start_opt = None;
     let mut last_source_in_block = None;
     for (source, op) in instructions {
+        // TODO: This panics because we use a dummy ELF in tests; fix it.
+        #[cfg(not(test))]
         log::trace!(
             "Instruction at {source} (0x{:x}): {op:?}",
             elf.section_by_index(source.section_index).original_address() + source.offset_range.start
@@ -2235,8 +2577,12 @@ fn split_code_into_basic_blocks(
                 ));
 
                 if let ControlInst::Branch { target_false, .. } = instruction {
-                    assert_eq!(source.section_index, target_false.section_index);
-                    assert_eq!(source.offset_range.end, target_false.offset);
+                    if !cfg!(test) {
+                        if source.section_index != target_false.section_index {
+                            return Err(ProgramFromElfError::other("found a branch with a fallthrough to another section"));
+                        }
+                        assert_eq!(source.offset_range.end, target_false.offset);
+                    }
                     block_start_opt = Some((block_section, source.offset_range.end));
                 }
             }
@@ -2261,11 +2607,7 @@ fn build_section_to_block_map(
 ) -> Result<HashMap<SectionTarget, BlockTarget>, ProgramFromElfError> {
     let mut section_to_block = HashMap::new();
     for (block_index, block) in blocks.iter().enumerate() {
-        let section_target = SectionTarget {
-            section_index: block.source.section_index,
-            offset: block.source.offset_range.start,
-        };
-
+        let section_target = block.source.begin();
         let block_target = BlockTarget::from_raw(block_index);
         if section_to_block.insert(section_target, block_target).is_some() {
             return Err(ProgramFromElfError::other("found two or more basic blocks with the same location"));
@@ -2322,13 +2664,13 @@ fn garbage_collect_reachability(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>
     let mut queue_code = VecSet::new();
     let mut queue_data = VecSet::new();
     for (block_target, reachability) in &reachability_graph.for_code {
-        if reachability.always_reachable {
+        if reachability.always_reachable_or_exported() {
             queue_code.push(*block_target);
         }
     }
 
     for (data_target, reachability) in &reachability_graph.for_data {
-        if reachability.always_reachable {
+        if reachability.always_reachable_or_exported() {
             queue_data.push(*data_target);
         }
     }
@@ -2651,6 +2993,7 @@ fn perform_nop_elimination(all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>]
 fn perform_inlining(
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
+    exports: &mut [Export],
     optimize_queue: Option<&mut VecSet<BlockTarget>>,
     inline_history: &mut HashSet<(BlockTarget, BlockTarget)>,
     inline_threshold: usize,
@@ -2740,6 +3083,13 @@ fn perform_inlining(
             return false;
         }
 
+        if let Some(fallthrough_target) = all_blocks[target.index()].next.instruction.fallthrough_target() {
+            if fallthrough_target.index() == target.index() + 1 {
+                // Do not inline if we'd need to inject a new fallthrough basic block.
+                return false;
+            }
+        }
+
         // Inline if the target block is small enough.
         if all_blocks[target.index()].ops.len() <= inline_threshold {
             return true;
@@ -2759,8 +3109,22 @@ fn perform_inlining(
         return false;
     }
 
-    match all_blocks[current.index()].next.instruction {
+    let block = &all_blocks[current.index()];
+    match block.next.instruction {
         ControlInst::Jump { target } => {
+            if all_blocks[current.index()].ops.is_empty() && inline_history.insert((current, target)) {
+                let reachability = reachability_graph.for_code.get_mut(&current).unwrap();
+                if !reachability.exports.is_empty() {
+                    let export_indexes = core::mem::take(&mut reachability.exports);
+                    for &export_index in &export_indexes {
+                        exports[export_index].location = all_blocks[target.index()].source.begin();
+                    }
+                    reachability_graph.for_code.get_mut(&target).unwrap().exports.extend(export_indexes);
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue, current);
+                    return true;
+                }
+            }
+
             if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) && inline_history.insert((current, target))
             {
                 inline(all_blocks, reachability_graph, optimize_queue, current, target);
@@ -2983,7 +3347,7 @@ fn perform_dead_code_elimination(
         }
     }
 
-    let initial_registers_needed = match all_blocks[block_target.index()].next.instruction {
+    let registers_needed_for_next_block = match all_blocks[block_target.index()].next.instruction {
         // If it's going to trap then it's not going to need any of the register values.
         ControlInst::Unimplemented => RegMask::empty(),
         // If it's a jump then we'll need whatever registers the jump target needs.
@@ -2997,34 +3361,24 @@ fn perform_dead_code_elimination(
     };
 
     let mut modified = false;
-    let registers_needed = perform_dead_code_elimination_on_block(
+    let registers_needed_for_this_block = perform_dead_code_elimination_on_block(
         config,
         imports,
         all_blocks,
         reachability_graph,
         optimize_queue.as_deref_mut(),
         &mut modified,
-        initial_registers_needed,
+        registers_needed_for_next_block,
         block_target,
     );
 
-    registers_needed_for_block[block_target.index()] = registers_needed;
-
-    for previous_block in previous_blocks {
-        if !reachability_graph.is_code_reachable(previous_block) {
-            continue;
+    if registers_needed_for_block[block_target.index()] != registers_needed_for_this_block {
+        registers_needed_for_block[block_target.index()] = registers_needed_for_this_block;
+        if let Some(ref mut optimize_queue) = optimize_queue {
+            for previous_block in previous_blocks {
+                add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, previous_block);
+            }
         }
-
-        perform_dead_code_elimination_on_block(
-            config,
-            imports,
-            all_blocks,
-            reachability_graph,
-            optimize_queue.as_deref_mut(),
-            &mut modified,
-            registers_needed,
-            previous_block,
-        );
     }
 
     modified
@@ -3033,51 +3387,87 @@ fn perform_dead_code_elimination(
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AnyAnyKind {
     Add,
+    Add64,
     Sub,
+    Sub64,
     And,
+    And64,
     Or,
+    Or64,
     Xor,
+    Xor64,
     SetLessThanUnsigned,
     SetLessThanSigned,
+    SetLessThanUnsigned64,
+    SetLessThanSigned64,
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
+    ShiftLogicalLeft64,
+    ShiftLogicalRight64,
+    ShiftArithmeticRight64,
 
     Mul,
+    Mul64,
     MulUpperSignedSigned,
+    MulUpperSignedSigned64,
     MulUpperUnsignedUnsigned,
+    MulUpperUnsignedUnsigned64,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum RegRegKind {
     MulUpperSignedUnsigned,
+    MulUpperSignedUnsigned64,
     Div,
+    Div64,
     DivUnsigned,
+    DivUnsigned64,
     Rem,
+    Rem64,
     RemUnsigned,
+    RemUnsigned64,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum OperationKind {
     Add,
+    Add64,
     Sub,
+    Sub64,
     And,
+    And64,
     Or,
+    Or64,
     Xor,
+    Xor64,
     SetLessThanUnsigned,
+    SetLessThanUnsigned64,
     SetLessThanSigned,
+    SetLessThanSigned64,
     ShiftLogicalLeft,
+    ShiftLogicalLeft64,
     ShiftLogicalRight,
+    ShiftLogicalRight64,
     ShiftArithmeticRight,
+    ShiftArithmeticRight64,
 
     Mul,
+    Mul64,
     MulUpperSignedSigned,
+    MulUpperSignedSigned64,
     MulUpperSignedUnsigned,
+    MulUpperSignedUnsigned64,
     MulUpperUnsignedUnsigned,
+    MulUpperUnsignedUnsigned64,
     Div,
+    Div64,
     DivUnsigned,
+    DivUnsigned64,
     Rem,
+    Rem64,
     RemUnsigned,
+    RemUnsigned64,
 
     Eq,
     NotEq,
@@ -3089,18 +3479,31 @@ impl From<AnyAnyKind> for OperationKind {
     fn from(kind: AnyAnyKind) -> Self {
         match kind {
             AnyAnyKind::Add => Self::Add,
+            AnyAnyKind::Add64 => Self::Add64,
             AnyAnyKind::Sub => Self::Sub,
+            AnyAnyKind::Sub64 => Self::Sub64,
             AnyAnyKind::And => Self::And,
+            AnyAnyKind::And64 => Self::And64,
             AnyAnyKind::Or => Self::Or,
+            AnyAnyKind::Or64 => Self::Or64,
             AnyAnyKind::Xor => Self::Xor,
+            AnyAnyKind::Xor64 => Self::Xor64,
             AnyAnyKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
+            AnyAnyKind::SetLessThanUnsigned64 => Self::SetLessThanUnsigned64,
             AnyAnyKind::SetLessThanSigned => Self::SetLessThanSigned,
+            AnyAnyKind::SetLessThanSigned64 => Self::SetLessThanSigned64,
             AnyAnyKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
+            AnyAnyKind::ShiftLogicalLeft64 => Self::ShiftLogicalLeft64,
             AnyAnyKind::ShiftLogicalRight => Self::ShiftLogicalRight,
+            AnyAnyKind::ShiftLogicalRight64 => Self::ShiftLogicalRight64,
             AnyAnyKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
+            AnyAnyKind::ShiftArithmeticRight64 => Self::ShiftArithmeticRight64,
             AnyAnyKind::Mul => Self::Mul,
+            AnyAnyKind::Mul64 => Self::Mul64,
             AnyAnyKind::MulUpperSignedSigned => Self::MulUpperSignedSigned,
+            AnyAnyKind::MulUpperSignedSigned64 => Self::MulUpperSignedSigned64,
             AnyAnyKind::MulUpperUnsignedUnsigned => Self::MulUpperUnsignedUnsigned,
+            AnyAnyKind::MulUpperUnsignedUnsigned64 => Self::MulUpperUnsignedUnsigned64,
         }
     }
 }
@@ -3109,10 +3512,15 @@ impl From<RegRegKind> for OperationKind {
     fn from(kind: RegRegKind) -> Self {
         match kind {
             RegRegKind::MulUpperSignedUnsigned => Self::MulUpperSignedUnsigned,
+            RegRegKind::MulUpperSignedUnsigned64 => Self::MulUpperSignedUnsigned64,
             RegRegKind::Div => Self::Div,
+            RegRegKind::Div64 => Self::Div64,
             RegRegKind::DivUnsigned => Self::DivUnsigned,
+            RegRegKind::DivUnsigned64 => Self::DivUnsigned64,
             RegRegKind::Rem => Self::Rem,
+            RegRegKind::Rem64 => Self::Rem64,
             RegRegKind::RemUnsigned => Self::RemUnsigned,
+            RegRegKind::RemUnsigned64 => Self::RemUnsigned64,
         }
     }
 }
@@ -3131,34 +3539,101 @@ impl From<BranchKind> for OperationKind {
 }
 
 impl OperationKind {
-    fn apply_const(self, lhs: i32, rhs: i32) -> i32 {
+    fn apply_const(self, lhs: i64, rhs: i64) -> i64 {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
-            Self::Add => lhs.wrapping_add(rhs),
-            Self::Sub => lhs.wrapping_sub(rhs),
-            Self::And => lhs & rhs,
-            Self::Or => lhs | rhs,
-            Self::Xor => lhs ^ rhs,
-            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
-            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
-            Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
-            Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
-            Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+            Self::Add => {
+                let lhs: i32 = lhs.try_into().expect("add operand overflow");
+                let rhs: i32 = rhs.try_into().expect("add operand overflow");
+                i32_to_i64(lhs.wrapping_add(rhs))
+            }
+            Self::Sub => {
+                let lhs: i32 = lhs.try_into().expect("sub operand overflow");
+                let rhs: i32 = rhs.try_into().expect("sub operand overflow");
+                i32_to_i64(lhs.wrapping_sub(rhs))
+            }
+            Self::And => {
+                let lhs: i32 = lhs.try_into().expect("and operand overflow");
+                let rhs: i32 = rhs.try_into().expect("and operand overflow");
+                i32_to_i64(lhs & rhs)
+            }
+            Self::Or => {
+                let lhs: i32 = lhs.try_into().expect("or operand overflow");
+                let rhs: i32 = rhs.try_into().expect("or operand overflow");
+                i32_to_i64(lhs | rhs)
+            }
+            Self::Xor => {
+                let lhs: i32 = lhs.try_into().expect("xor operand overflow");
+                let rhs: i32 = rhs.try_into().expect("xor operand overflow");
+                i32_to_i64(lhs ^ rhs)
+            }
+            Self::SetLessThanUnsigned => i64::from((lhs as u64) < (rhs as u64)),
+            Self::SetLessThanSigned => i64::from((lhs as i64) < (rhs as i64)),
+            Self::ShiftLogicalLeft => {
+                let lhs: i32 = lhs.try_into().expect("shl operand overflow");
+                let rhs: i32 = rhs.try_into().expect("shl operand overflow");
+                i32_to_i64((lhs as u32).wrapping_shl(rhs as u32) as i32)
+            }
+            Self::ShiftLogicalRight => {
+                let lhs: i32 = lhs.try_into().expect("shr operand overflow");
+                let rhs: i32 = rhs.try_into().expect("shr operand overflow");
+                i32_to_i64((lhs as u32).wrapping_shr(rhs as u32) as i32)
+            }
+            Self::ShiftArithmeticRight => {
+                let lhs: i32 = lhs.try_into().expect("sha operand overflow");
+                let rhs: i32 = rhs.try_into().expect("sha operand overflow");
+                i32_to_i64((lhs as i32).wrapping_shr(rhs as u32))
+            }
 
-            Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
-            Self::MulUpperSignedSigned => mulh(lhs, rhs),
-            Self::MulUpperSignedUnsigned => mulhsu(lhs, rhs as u32),
-            Self::MulUpperUnsignedUnsigned => mulhu(lhs as u32, rhs as u32) as i32,
-            Self::Div => div(lhs, rhs),
-            Self::DivUnsigned => divu(lhs as u32, rhs as u32) as i32,
-            Self::Rem => rem(lhs, rhs),
-            Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
+            Self::Mul => {
+                let lhs: i32 = lhs.try_into().expect("mul operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mul operand overflow");
+                i32_to_i64((lhs as i32).wrapping_mul(rhs as i32))
+            }
+            Self::MulUpperSignedSigned => {
+                let lhs: i32 = lhs.try_into().expect("mulh operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulh operand overflow");
+                i32_to_i64(mulh(lhs, rhs))
+            }
+            Self::MulUpperSignedUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("mulhsu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulhsu operand overflow");
+                i32_to_i64(mulhsu(lhs, rhs as u32))
+            }
+            Self::MulUpperUnsignedUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("mulhu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulhu operand overflow");
+                i32_to_i64(mulhu(lhs as u32, rhs as u32) as i32)
+            }
+            Self::Div => {
+                let lhs: i32 = lhs.try_into().expect("div operand overflow");
+                let rhs: i32 = rhs.try_into().expect("div operand overflow");
+                i32_to_i64(div(lhs, rhs))
+            }
+            Self::DivUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("divu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("divu operand overflow");
+                i32_to_i64(divu(lhs as u32, rhs as u32) as i32)
+            }
+            Self::Rem => {
+                let lhs: i32 = lhs.try_into().expect("rem operand overflow");
+                let rhs: i32 = rhs.try_into().expect("rem operand overflow");
+                i32_to_i64(rem(lhs, rhs))
+            }
+            Self::RemUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("remu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("remu operand overflow");
+                i32_to_i64(remu(lhs as u32, rhs as u32) as i32)
+            }
 
-            Self::Eq => i32::from(lhs == rhs),
-            Self::NotEq => i32::from(lhs != rhs),
-            Self::SetGreaterOrEqualUnsigned => i32::from((lhs as u32) >= (rhs as u32)),
-            Self::SetGreaterOrEqualSigned => i32::from((lhs as i32) >= (rhs as i32)),
+            Self::Eq => i64::from(lhs == rhs),
+            Self::NotEq => i64::from(lhs != rhs),
+            Self::SetGreaterOrEqualUnsigned => i64::from((lhs as u64) >= (rhs as u64)),
+            Self::SetGreaterOrEqualSigned => i64::from((lhs as i64) >= (rhs as i64)),
+
+            Self::Add64 => lhs.wrapping_add(rhs),
+            _ => todo!("unimplemented 64-bit operation: {self:?}"),
         }
     }
 
@@ -3172,7 +3647,7 @@ impl OperationKind {
                 C(self.apply_const(lhs, rhs))
             },
             (O::Add | O::Sub, RegValue::DataAddress(lhs), C(rhs)) => {
-                RegValue::DataAddress(lhs.map_offset_i32(|lhs| self.apply_const(lhs, rhs)))
+                RegValue::DataAddress(lhs.map_offset_i64(|lhs| self.apply_const(lhs, rhs)))
             }
 
             // (x == x) = 1
@@ -3235,8 +3710,16 @@ enum RegValue {
     InputReg(Reg, BlockTarget),
     CodeAddress(BlockTarget),
     DataAddress(SectionTarget),
-    Constant(i32),
-    Unknown { unique: u64, bits_used: u32 },
+    Constant(i64),
+    OutputReg {
+        reg: Reg,
+        source_block: BlockTarget,
+        bits_used: u64,
+    },
+    Unknown {
+        unique: u64,
+        bits_used: u64,
+    },
 }
 
 impl RegValue {
@@ -3250,35 +3733,48 @@ impl RegValue {
                 dst,
                 target: AnyTarget::Data(target),
             }),
-            RegValue::Constant(imm) => Some(BasicInst::LoadImmediate { dst, imm }),
+            RegValue::Constant(imm) => {
+                let imm = i32::try_from(imm).expect("load immediate operand overflow");
+                Some(BasicInst::LoadImmediate { dst, imm })
+            }
             _ => None,
         }
     }
 
-    fn bits_used(self) -> u32 {
+    fn bits_used(self) -> u64 {
         match self {
-            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => !0,
-            RegValue::Constant(value) => value as u32,
-            RegValue::Unknown { bits_used, .. } => bits_used,
+            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => u64::from(u32::MAX),
+            RegValue::Constant(value) => u64::from(value as u32),
+            RegValue::Unknown { bits_used, .. } | RegValue::OutputReg { bits_used, .. } => bits_used,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct BlockRegs {
     regs: [RegValue; Reg::ALL.len()],
 }
 
 impl BlockRegs {
-    fn new(source_block: BlockTarget) -> Self {
+    fn new_input(source_block: BlockTarget) -> Self {
         BlockRegs {
             regs: Reg::ALL.map(|reg| RegValue::InputReg(reg, source_block)),
         }
     }
 
+    fn new_output(source_block: BlockTarget) -> Self {
+        BlockRegs {
+            regs: Reg::ALL.map(|reg| RegValue::OutputReg {
+                reg,
+                source_block,
+                bits_used: u64::from(u32::MAX),
+            }),
+        }
+    }
+
     fn get_reg(&self, reg: impl Into<RegImm>) -> RegValue {
         match reg.into() {
-            RegImm::Imm(imm) => RegValue::Constant(imm as i32),
+            RegImm::Imm(imm) => RegValue::Constant(i32_to_i64(imm as i32)),
             RegImm::Reg(reg) => self.regs[reg as usize],
         }
     }
@@ -3351,7 +3847,7 @@ impl BlockRegs {
         None
     }
 
-    fn simplify_instruction(&self, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+    fn simplify_instruction(&self, rv64: bool, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
         match instruction {
             BasicInst::RegReg { kind, dst, src1, src2 } => {
                 let src1_value = self.get_reg(src1);
@@ -3398,6 +3894,18 @@ impl BlockRegs {
                             src1,
                             src2: RegImm::Imm(value as u32),
                         });
+                    }
+                }
+
+                if (!rv64 && kind == AnyAnyKind::Add) || (rv64 && kind == AnyAnyKind::Add64) {
+                    if src1_value == RegValue::Constant(0) {
+                        if let RegImm::Reg(src) = src2 {
+                            return Some(BasicInst::MoveReg { dst, src });
+                        }
+                    } else if src2_value == RegValue::Constant(0) {
+                        if let RegImm::Reg(src) = src1 {
+                            return Some(BasicInst::MoveReg { dst, src });
+                        }
                     }
                 }
 
@@ -3477,7 +3985,12 @@ impl BlockRegs {
                 }
             }
             BasicInst::LoadImmediate { dst, imm } => {
-                if self.get_reg(dst) == RegValue::Constant(imm) {
+                if self.get_reg(dst) == RegValue::Constant(i32_to_i64(imm)) {
+                    return Some(BasicInst::Nop);
+                }
+            }
+            BasicInst::MoveReg { dst, src } => {
+                if dst == src {
                     return Some(BasicInst::Nop);
                 }
             }
@@ -3487,7 +4000,7 @@ impl BlockRegs {
         None
     }
 
-    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u32) {
+    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u64) {
         if bits_used == 0 {
             self.set_reg(dst, RegValue::Constant(0));
             return;
@@ -3506,7 +4019,7 @@ impl BlockRegs {
     fn set_reg_from_instruction(&mut self, imports: &[Import], unknown_counter: &mut u64, instruction: BasicInst<AnyTarget>) {
         match instruction {
             BasicInst::LoadImmediate { dst, imm } => {
-                self.set_reg(dst, RegValue::Constant(imm));
+                self.set_reg(dst, RegValue::Constant(i32_to_i64(imm)));
             }
             BasicInst::LoadAddress {
                 dst,
@@ -3527,6 +4040,9 @@ impl BlockRegs {
                 target: AnyTarget::Data(target),
             } => {
                 self.set_reg(dst, RegValue::DataAddress(target));
+            }
+            BasicInst::MoveReg { dst, src } => {
+                self.set_reg(dst, self.get_reg(src));
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::Add | AnyAnyKind::Or,
@@ -3608,7 +4124,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U8, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u8::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u8::MAX));
             }
             BasicInst::LoadAbsolute {
                 kind: LoadKind::U16, dst, ..
@@ -3616,11 +4132,11 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U16, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u16::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u16::MAX));
             }
             _ => {
                 for dst in instruction.dst_mask(imports) {
-                    self.set_reg_unknown(dst, unknown_counter, !0);
+                    self.set_reg_unknown(dst, unknown_counter, u64::from(u32::MAX));
                 }
             }
         }
@@ -3628,159 +4144,187 @@ impl BlockRegs {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn perform_constant_propagation(
+fn perform_constant_propagation<H>(
     imports: &[Import],
-    elf: &Elf,
+    elf: &Elf<H>,
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    regs_for_block: &mut [BlockRegs],
+    input_regs_for_block: &mut [BlockRegs],
+    output_regs_for_block: &mut [BlockRegs],
     unknown_counter: &mut u64,
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
-    mut current: BlockTarget,
-) -> bool {
-    let mut regs = regs_for_block[current.index()].clone();
+    current: BlockTarget,
+) -> bool
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
+    let Some(reachability) = reachability_graph.for_code.get(&current) else {
+        return false;
+    };
+
+    if reachability.is_unreachable() {
+        return false;
+    }
+
     let mut modified = false;
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(current) {
-            // Prevent an infinite loop.
-            break;
-        }
+    if !reachability.is_dynamically_reachable()
+        && !reachability.always_reachable_or_exported()
+        && !reachability.reachable_from.is_empty()
+        && reachability.reachable_from.len() < 64
+    {
+        for reg in Reg::ALL {
+            let mut common_value_opt = None;
+            for &source in &reachability.reachable_from {
+                let value = output_regs_for_block[source.index()].get_reg(reg);
+                if value == RegValue::InputReg(reg, current) {
+                    continue;
+                }
 
-        if !reachability_graph.is_code_reachable(current) {
-            break;
-        }
+                if let Some(common_value) = common_value_opt {
+                    if common_value == value {
+                        continue;
+                    }
 
-        let mut references = BTreeSet::new();
-        let mut modified_this_block = false;
-        for nth_instruction in 0..all_blocks[current.index()].ops.len() {
-            let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
-            if instruction.is_nop() {
-                continue;
+                    common_value_opt = None;
+                    break;
+                } else {
+                    common_value_opt = Some(value);
+                }
             }
 
-            while let Some(new_instruction) = regs.simplify_instruction(instruction) {
-                if !modified_this_block {
-                    references = gather_references(&all_blocks[current.index()]);
-                    modified_this_block = true;
+            if let Some(value) = common_value_opt {
+                let old_value = input_regs_for_block[current.index()].get_reg(reg);
+                if value != old_value {
+                    input_regs_for_block[current.index()].set_reg(reg, value);
                     modified = true;
                 }
-
-                instruction = new_instruction;
-                all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
             }
+        }
+    }
 
-            if let BasicInst::LoadAbsolute { kind, dst, target } = instruction {
-                let section = elf.section_by_index(target.section_index);
-                if section.is_allocated() && !section.is_writable() {
-                    let value = match kind {
-                        LoadKind::U32 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 4)
-                            .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
-                        LoadKind::U16 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
-                        LoadKind::I16 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
-                        LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
-                        LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
-                    };
-
-                    if let Some(imm) = value {
-                        if !modified_this_block {
-                            references = gather_references(&all_blocks[current.index()]);
-                            modified_this_block = true;
-                            modified = true;
-                        }
-
-                        instruction = BasicInst::LoadImmediate { dst, imm };
-                        all_blocks[current.index()].ops[nth_instruction].1 = instruction;
-                    }
-                }
-            }
-
-            regs.set_reg_from_instruction(imports, unknown_counter, instruction);
+    let mut regs = input_regs_for_block[current.index()].clone();
+    let mut references = BTreeSet::new();
+    let mut modified_this_block = false;
+    for nth_instruction in 0..all_blocks[current.index()].ops.len() {
+        let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
+        if instruction.is_nop() {
+            continue;
         }
 
-        while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
-            log::trace!(
-                "Simplifying end of {current:?}: {:?} -> {:?}",
-                all_blocks[current.index()].next.instruction,
-                new_instruction
-            );
-
+        while let Some(new_instruction) = regs.simplify_instruction(elf.is_64(), instruction) {
             if !modified_this_block {
                 references = gather_references(&all_blocks[current.index()]);
                 modified_this_block = true;
                 modified = true;
             }
 
-            all_blocks[current.index()].next.instruction = new_instruction;
+            instruction = new_instruction;
+            all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
         }
 
-        if modified_this_block {
-            update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
-            if !reachability_graph.is_code_reachable(current) {
-                break;
-            }
+        if let BasicInst::LoadAbsolute { kind, dst, target } = instruction {
+            let section = elf.section_by_index(target.section_index);
+            if section.is_allocated() && !section.is_writable() {
+                let value = match kind {
+                    LoadKind::U64 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 8)
+                        .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]))
+                        .map(|_| todo!("64bit support")),
+                    LoadKind::U32 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 4)
+                        .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                    LoadKind::I32 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 4)
+                        .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
+                    LoadKind::U16 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 2)
+                        .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
+                    LoadKind::I16 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 2)
+                        .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
+                    LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
+                    LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
+                };
 
+                if let Some(imm) = value {
+                    if !modified_this_block {
+                        references = gather_references(&all_blocks[current.index()]);
+                        modified_this_block = true;
+                        modified = true;
+                    }
+
+                    instruction = BasicInst::LoadImmediate { dst, imm };
+                    all_blocks[current.index()].ops[nth_instruction].1 = instruction;
+                }
+            }
+        }
+
+        regs.set_reg_from_instruction(imports, unknown_counter, instruction);
+    }
+
+    for reg in Reg::ALL {
+        if let RegValue::Unknown { bits_used, .. } = regs.get_reg(reg) {
+            regs.set_reg(
+                reg,
+                RegValue::OutputReg {
+                    reg,
+                    source_block: current,
+                    bits_used,
+                },
+            )
+        }
+    }
+
+    let output_regs_modified = output_regs_for_block[current.index()] != regs;
+    if output_regs_modified {
+        output_regs_for_block[current.index()] = regs.clone();
+        modified = true;
+    }
+
+    while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
+        log::trace!(
+            "Simplifying end of {current:?}: {:?} -> {:?}",
+            all_blocks[current.index()].next.instruction,
+            new_instruction
+        );
+
+        if !modified_this_block {
+            references = gather_references(&all_blocks[current.index()]);
+            modified_this_block = true;
+            modified = true;
+        }
+
+        all_blocks[current.index()].next.instruction = new_instruction;
+    }
+
+    if modified_this_block {
+        update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
+        if reachability_graph.is_code_reachable(current) {
             if let Some(ref mut optimize_queue) = optimize_queue {
                 add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
             }
         }
+    }
 
-        match all_blocks[current.index()].next.instruction {
-            ControlInst::Jump { target }
-                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) =>
-            {
-                current = target;
-                regs_for_block[current.index()] = regs.clone();
-                continue;
+    if let Some(ref mut optimize_queue) = optimize_queue {
+        if output_regs_modified {
+            match all_blocks[current.index()].next.instruction {
+                ControlInst::Jump { target } => add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target),
+                ControlInst::Branch {
+                    target_true, target_false, ..
+                } => {
+                    add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_true);
+                    add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_false);
+                }
+                ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
+                _ => {}
             }
-            ControlInst::Branch {
-                target_true, target_false, ..
-            } => {
-                let true_only_reachable_from_here = current != target_true
-                    && reachability_graph
-                        .for_code
-                        .get(&target_true)
-                        .unwrap()
-                        .is_only_reachable_from(current);
-
-                let false_only_reachable_from_here = current != target_false
-                    && reachability_graph
-                        .for_code
-                        .get(&target_false)
-                        .unwrap()
-                        .is_only_reachable_from(current);
-
-                if true_only_reachable_from_here {
-                    regs_for_block[target_true.index()] = regs.clone();
-                }
-
-                if false_only_reachable_from_here {
-                    regs_for_block[target_false.index()] = regs.clone();
-                }
-
-                if true_only_reachable_from_here {
-                    current = target_true;
-                    continue;
-                }
-
-                if false_only_reachable_from_here {
-                    current = target_false;
-                    continue;
-                }
-            }
-            ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
-            _ => {}
         }
-
-        break;
     }
 
     modified
@@ -3830,13 +4374,16 @@ fn perform_load_address_and_jump_fusion(all_blocks: &mut [BasicBlock<AnyTarget, 
     }
 }
 
-fn optimize_program(
+fn optimize_program<H>(
     config: &Config,
-    elf: &Elf,
+    elf: &Elf<H>,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
-) {
+    exports: &mut [Export],
+) where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut optimize_queue = VecSet::new();
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
         if !reachability_graph.is_code_reachable(current) {
@@ -3884,9 +4431,11 @@ fn optimize_program(
     optimize_queue.vec.reverse();
 
     let mut unknown_counter = 0;
-    let mut regs_for_block = Vec::with_capacity(all_blocks.len());
+    let mut input_regs_for_block = Vec::with_capacity(all_blocks.len());
+    let mut output_regs_for_block = Vec::with_capacity(all_blocks.len());
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-        regs_for_block.push(BlockRegs::new(current))
+        input_regs_for_block.push(BlockRegs::new_input(current));
+        output_regs_for_block.push(BlockRegs::new_output(current));
     }
 
     let mut registers_needed_for_block = Vec::with_capacity(all_blocks.len());
@@ -3907,6 +4456,7 @@ fn optimize_program(
         perform_inlining(
             all_blocks,
             reachability_graph,
+            exports,
             Some(&mut optimize_queue),
             &mut inline_history,
             config.inline_threshold,
@@ -3925,7 +4475,8 @@ fn optimize_program(
             imports,
             elf,
             all_blocks,
-            &mut regs_for_block,
+            &mut input_regs_for_block,
+            &mut output_regs_for_block,
             &mut unknown_counter,
             reachability_graph,
             Some(&mut optimize_queue),
@@ -3953,6 +4504,7 @@ fn optimize_program(
             modified |= perform_inlining(
                 all_blocks,
                 reachability_graph,
+                exports,
                 None,
                 &mut inline_history,
                 config.inline_threshold,
@@ -3971,7 +4523,8 @@ fn optimize_program(
                 imports,
                 elf,
                 all_blocks,
-                &mut regs_for_block,
+                &mut input_regs_for_block,
+                &mut output_regs_for_block,
                 &mut unknown_counter,
                 reachability_graph,
                 None,
@@ -3990,6 +4543,484 @@ fn optimize_program(
         "Optimizing the program took {} brute force iteration(s)",
         opt_brute_force_iterations - 1
     );
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use polkavm::Reg;
+
+    struct ProgramBuilder {
+        data_section: SectionIndex,
+        current_section: SectionIndex,
+        next_free_section: SectionIndex,
+        next_offset_for_section: HashMap<SectionIndex, u64>,
+        instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
+        exports: Vec<Export>,
+    }
+
+    struct TestProgram {
+        disassembly: String,
+        instance: polkavm::RawInstance,
+    }
+
+    impl ProgramBuilder {
+        fn new() -> Self {
+            ProgramBuilder {
+                data_section: SectionIndex::new(0),
+                current_section: SectionIndex::new(1),
+                next_free_section: SectionIndex::new(1),
+                next_offset_for_section: HashMap::default(),
+                instructions: Vec::new(),
+                exports: Vec::new(),
+            }
+        }
+
+        fn from_assembly(assembly: &str) -> Self {
+            let mut b = Self::new();
+            b.append_assembly(assembly);
+            b
+        }
+
+        fn add_export(&mut self, name: impl AsRef<[u8]>, input_regs: u8, output_regs: u8, location: SectionTarget) {
+            self.exports.push(Export {
+                location,
+                metadata: ExternMetadata {
+                    index: None,
+                    symbol: name.as_ref().to_owned(),
+                    input_regs,
+                    output_regs,
+                },
+            })
+        }
+
+        fn add_section(&mut self) -> SectionTarget {
+            let index = self.next_free_section;
+            self.next_offset_for_section.insert(index, 0);
+            self.next_free_section = SectionIndex::new(index.raw() + 1);
+            SectionTarget {
+                section_index: index,
+                offset: 0,
+            }
+        }
+
+        fn switch_section(&mut self, section_index: impl Into<SectionIndex>) {
+            self.current_section = section_index.into();
+        }
+
+        fn current_source(&self) -> Source {
+            let next_offset = self.next_offset_for_section.get(&self.current_section).copied().unwrap_or(0);
+            Source {
+                section_index: self.current_section,
+                offset_range: (next_offset..next_offset + 4).into(),
+            }
+        }
+
+        fn push(&mut self, inst: impl Into<InstExt<SectionTarget, SectionTarget>>) -> SectionTarget {
+            let source = self.current_source();
+            *self.next_offset_for_section.get_mut(&self.current_section).unwrap() += 4;
+            self.instructions.push((source, inst.into()));
+            source.begin()
+        }
+
+        fn append_assembly(&mut self, assembly: &str) {
+            let raw_blob = polkavm_common::assembler::assemble(assembly).unwrap();
+            let blob = ProgramBlob::parse(raw_blob.into()).unwrap();
+            let mut program_counter_to_section_target = HashMap::new();
+            let mut program_counter_to_instruction_index = HashMap::new();
+            let mut in_new_block = true;
+            for instruction in blob.instructions(Bitness::B32) {
+                if in_new_block {
+                    let block = self.add_section();
+                    self.switch_section(block);
+                    program_counter_to_section_target.insert(instruction.offset, block);
+                    in_new_block = false;
+                }
+
+                program_counter_to_instruction_index.insert(instruction.offset, self.instructions.len());
+                self.push(BasicInst::Nop);
+
+                if instruction.kind.starts_new_basic_block() {
+                    in_new_block = true;
+                }
+            }
+
+            for instruction in blob.instructions(Bitness::B32) {
+                let out = &mut self.instructions[*program_counter_to_instruction_index.get(&instruction.offset).unwrap()].1;
+                match instruction.kind {
+                    Instruction::fallthrough => {
+                        let target = *program_counter_to_section_target.get(&instruction.next_offset).unwrap();
+                        *out = ControlInst::Jump { target }.into();
+                    }
+                    Instruction::jump(target) => {
+                        let target = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
+                        *out = ControlInst::Jump { target }.into();
+                    }
+                    Instruction::load_imm(dst, imm) => {
+                        *out = BasicInst::LoadImmediate {
+                            dst: dst.into(),
+                            imm: imm as i32,
+                        }
+                        .into();
+                    }
+                    Instruction::add_imm(dst, src, imm) => {
+                        *out = BasicInst::AnyAny {
+                            kind: AnyAnyKind::Add,
+                            dst: dst.into(),
+                            src1: src.into(),
+                            src2: imm.into(),
+                        }
+                        .into();
+                    }
+                    Instruction::add(dst, src1, src2) => {
+                        *out = BasicInst::AnyAny {
+                            kind: AnyAnyKind::Add,
+                            dst: dst.into(),
+                            src1: src1.into(),
+                            src2: src2.into(),
+                        }
+                        .into();
+                    }
+                    Instruction::branch_less_unsigned_imm(src1, src2, target) | Instruction::branch_eq_imm(src1, src2, target) => {
+                        let target_true = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
+                        let target_false = *program_counter_to_section_target.get(&instruction.next_offset).unwrap();
+                        *out = ControlInst::Branch {
+                            kind: match instruction.kind {
+                                Instruction::branch_less_unsigned_imm(..) => BranchKind::LessUnsigned,
+                                Instruction::branch_eq_imm(..) => BranchKind::Eq,
+                                _ => unreachable!(),
+                            },
+                            src1: src1.into(),
+                            src2: src2.into(),
+                            target_true,
+                            target_false,
+                        }
+                        .into();
+                    }
+                    Instruction::jump_indirect(base, 0) => {
+                        *out = ControlInst::JumpIndirect {
+                            base: base.into(),
+                            offset: 0,
+                        }
+                        .into();
+                    }
+                    Instruction::trap => {
+                        *out = ControlInst::Unimplemented.into();
+                    }
+                    Instruction::store_u32(src, address) => {
+                        *out = BasicInst::StoreAbsolute {
+                            kind: StoreKind::U32,
+                            src: src.into(),
+                            target: SectionTarget {
+                                section_index: self.data_section,
+                                offset: u64::from(address),
+                            },
+                        }
+                        .into();
+                    }
+                    Instruction::store_indirect_u32(src, base, offset) => {
+                        *out = BasicInst::StoreIndirect {
+                            kind: StoreKind::U32,
+                            src: src.into(),
+                            base: base.into(),
+                            offset: offset as i32,
+                        }
+                        .into();
+                    }
+                    _ => unimplemented!("{instruction:?}"),
+                }
+            }
+
+            for export in blob.exports() {
+                let input_regs = 1;
+                let output_regs = 1;
+                let target = program_counter_to_section_target.get(&export.program_counter()).unwrap();
+                self.add_export(export.symbol().as_bytes(), input_regs, output_regs, *target);
+            }
+        }
+
+        fn build(&self, config: Config) -> TestProgram {
+            let elf: Elf<object::elf::FileHeader32<object::endian::LittleEndian>> = Elf::default();
+            let data_sections_set: HashSet<_> = core::iter::once(self.data_section).collect();
+            let code_sections_set: HashSet<_> = self.next_offset_for_section.keys().copied().collect();
+            let relocations = BTreeMap::default();
+            let imports = [];
+            let mut exports = self.exports.clone();
+
+            // TODO: Refactor the main code so that we don't have to copy-paste this here.
+            let all_jump_targets = harvest_all_jump_targets(
+                &elf,
+                &data_sections_set,
+                &code_sections_set,
+                &self.instructions,
+                &relocations,
+                &exports,
+            )
+            .unwrap();
+
+            let all_blocks = split_code_into_basic_blocks(&elf, &all_jump_targets, self.instructions.clone()).unwrap();
+            let mut section_to_block = build_section_to_block_map(&all_blocks).unwrap();
+            let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks).unwrap();
+            let mut reachability_graph =
+                calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
+            if config.optimize {
+                optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+            }
+            let mut used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
+
+            if config.optimize {
+                used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
+                merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
+                replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
+            }
+
+            let expected_reachability_graph =
+                calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
+            assert!(reachability_graph == expected_reachability_graph);
+
+            let used_imports = HashSet::new();
+            let mut base_address_for_section = HashMap::new();
+            base_address_for_section.insert(self.data_section, 0);
+            let section_got = self.next_free_section;
+            let target_to_got_offset = HashMap::new();
+
+            let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
+            let code = emit_code(
+                &imports,
+                &base_address_for_section,
+                section_got,
+                &target_to_got_offset,
+                &all_blocks,
+                &used_blocks,
+                &used_imports,
+                &jump_target_for_block,
+                true,
+            )
+            .unwrap();
+
+            let mut builder = ProgramBlobBuilder::new();
+
+            let mut export_count = 0;
+            for current in used_blocks {
+                for &export_index in &reachability_graph.for_code.get(&current).unwrap().exports {
+                    let export = &exports[export_index];
+                    let jump_target = jump_target_for_block[current.index()]
+                        .expect("internal error: export metadata points to a block without a jump target assigned");
+
+                    builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+                    export_count += 1;
+                }
+            }
+            assert_eq!(export_count, exports.len());
+
+            let mut raw_code = Vec::with_capacity(code.len());
+            for (_, inst) in code {
+                raw_code.push(inst);
+            }
+
+            builder.set_code(&raw_code, &jump_table);
+            builder.set_rw_data_size(1);
+
+            let blob = ProgramBlob::parse(builder.to_vec().into()).unwrap();
+            let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
+            disassembler.emit_header(false);
+            disassembler.show_offsets(false);
+            let mut buf = Vec::new();
+            disassembler.disassemble_into(&mut buf).unwrap();
+            let disassembly = String::from_utf8(buf).unwrap();
+
+            let mut config = polkavm::Config::from_env().unwrap();
+            config.set_backend(Some(polkavm::BackendKind::Interpreter));
+            let engine = polkavm::Engine::new(&config).unwrap();
+            let mut module_config = polkavm::ModuleConfig::default();
+            module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+            let module = polkavm::Module::from_blob(&engine, &module_config, blob).unwrap();
+            let mut instance = module.instantiate().unwrap();
+            instance.set_gas(10000);
+            instance.set_reg(polkavm::Reg::RA, polkavm::RETURN_TO_HOST);
+            let pc = module.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
+            instance.set_next_program_counter(pc);
+
+            TestProgram { disassembly, instance }
+        }
+
+        fn test_optimize(
+            &self,
+            mut run: impl FnMut(&mut polkavm::RawInstance),
+            mut check: impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance),
+            expected_disassembly: &str,
+        ) {
+            let mut unopt = self.build(Config {
+                optimize: false,
+                ..Config::default()
+            });
+            let mut opt = self.build(Config {
+                optimize: true,
+                ..Config::default()
+            });
+
+            log::info!("Unoptimized disassembly:\n{}", unopt.disassembly);
+            log::info!("Optimized disassembly:\n{}", opt.disassembly);
+
+            run(&mut unopt.instance);
+            run(&mut opt.instance);
+
+            check(&mut opt.instance, &mut unopt.instance);
+
+            fn normalize(s: &str) -> String {
+                let mut out = String::new();
+                for line in s.trim().lines() {
+                    if !line.trim().starts_with('@') {
+                        out.push_str("    ");
+                    }
+                    out.push_str(line.trim());
+                    out.push('\n');
+                }
+                out
+            }
+
+            let is_todo = expected_disassembly.trim() == "TODO";
+            let actual_normalized = normalize(&opt.disassembly);
+            let expected_normalized = normalize(expected_disassembly);
+            if actual_normalized != expected_normalized && !is_todo {
+                use core::fmt::Write;
+                let mut output_actual = String::new();
+                let mut output_expected = String::new();
+                for diff in diff::lines(&actual_normalized, &expected_normalized) {
+                    match diff {
+                        diff::Result::Left(line) => {
+                            writeln!(&mut output_actual, "{}", yansi::Paint::red(line)).unwrap();
+                        }
+                        diff::Result::Both(line, _) => {
+                            writeln!(&mut output_actual, "{}", line).unwrap();
+                            writeln!(&mut output_expected, "{}", line).unwrap();
+                        }
+                        diff::Result::Right(line) => {
+                            writeln!(&mut output_expected, "{}", line).unwrap();
+                        }
+                    }
+                }
+
+                {
+                    use std::io::Write;
+                    let stderr = std::io::stderr();
+                    let mut stderr = stderr.lock();
+
+                    writeln!(&mut stderr, "Optimization test failed!\n").unwrap();
+                    writeln!(&mut stderr, "Expected optimized:").unwrap();
+                    writeln!(&mut stderr, "{output_expected}").unwrap();
+                    writeln!(&mut stderr, "Actual optimized:").unwrap();
+                    writeln!(&mut stderr, "{output_actual}").unwrap();
+                }
+
+                panic!("optimized program is not what we've expected")
+            }
+
+            if is_todo {
+                todo!();
+            }
+        }
+
+        fn test_optimize_oneshot(
+            assembly: &str,
+            expected_disassembly: &str,
+            run: impl FnMut(&mut polkavm::RawInstance),
+            check: impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance),
+        ) {
+            let _ = env_logger::try_init();
+            let b = ProgramBuilder::from_assembly(assembly);
+            b.test_optimize(run, check, expected_disassembly);
+        }
+    }
+
+    fn expect_finished(i: &mut polkavm::RawInstance) {
+        assert!(matches!(i.run().unwrap(), polkavm::InterruptKind::Finished));
+    }
+
+    fn expect_regs(regs: impl IntoIterator<Item = (Reg, u32)> + Clone) -> impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance) {
+        move |a: &mut polkavm::RawInstance, b: &mut polkavm::RawInstance| {
+            for (reg, value) in regs.clone() {
+                assert_eq!(b.reg(reg), value);
+                assert_eq!(a.reg(reg), b.reg(reg));
+            }
+        }
+    }
+
+    #[test]
+    fn test_optimize_01_empty_block_elimination() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                jump @loop
+            @before_loop:
+                jump @loop
+            @loop:
+                a0 = a0 + 0x1
+                jump @before_loop if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a0 = a0 + 0x1
+                jump @0 if a0 <u 10
+            @1
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10)]),
+        )
+    }
+
+    #[test]
+    fn test_optimize_02_simple_constant_propagation() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                a1 = 1
+            @loop:
+                a0 = a0 + a1
+                jump @loop if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a1 = 0x1
+                fallthrough
+            @1
+                a0 = a0 + 0x1
+                jump @1 if a0 <u 10
+            @2
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10), (Reg::A1, 1)]),
+        )
+    }
+
+    #[test]
+    fn test_optimize_03_simple_dead_code_elimination() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                a1 = a1 + 100
+                a1 = 8
+                a2 = a2 + 0
+                a0 = a0 + 1
+                jump @main if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a1 = 0x8
+                a0 = a0 + 0x1
+                jump @0 if a0 <u 10
+            @1
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10), (Reg::A1, 8)]),
+        )
+    }
 }
 
 fn collect_used_blocks(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], reachability_graph: &ReachabilityGraph) -> Vec<BlockTarget> {
@@ -4018,38 +5049,42 @@ fn add_missing_fallthrough_blocks(
             continue;
         }
 
-        let references = gather_references(&all_blocks[current.index()]);
-        let new_fallthrough_target = BlockTarget::from_raw(all_blocks.len());
-        let old_fallthrough_target = match &mut all_blocks[current.index()].next.instruction {
-            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => continue,
-            ControlInst::Branch { target_false: target, .. }
-            | ControlInst::Call { target_return: target, .. }
-            | ControlInst::CallIndirect { target_return: target, .. } => core::mem::replace(target, new_fallthrough_target),
+        let Some(target) = all_blocks[current.index()].next.instruction.fallthrough_target_mut().copied() else {
+            continue;
         };
 
+        let inline_target = target != current
+            && all_blocks[target.index()].ops.is_empty()
+            && all_blocks[target.index()].next.instruction.fallthrough_target_mut().is_none();
+
+        let new_block_index = BlockTarget::from_raw(all_blocks.len());
         all_blocks.push(BasicBlock {
-            target: new_fallthrough_target,
+            target: new_block_index,
             source: all_blocks[current.index()].source,
             ops: Default::default(),
-            next: EndOfBlock {
-                source: all_blocks[current.index()].next.source.clone(),
-                instruction: ControlInst::Jump {
-                    target: old_fallthrough_target,
-                },
+            next: if inline_target {
+                all_blocks[target.index()].next.clone()
+            } else {
+                EndOfBlock {
+                    source: all_blocks[current.index()].next.source.clone(),
+                    instruction: ControlInst::Jump { target },
+                }
             },
         });
 
+        new_used_blocks.push(new_block_index);
+
         reachability_graph
             .for_code
-            .get_mut(&old_fallthrough_target)
-            .unwrap()
-            .reachable_from
-            .insert(new_fallthrough_target);
+            .entry(new_block_index)
+            .or_insert(Reachability::default())
+            .always_reachable = true;
+        update_references(all_blocks, reachability_graph, None, new_block_index, Default::default());
+        reachability_graph.for_code.get_mut(&new_block_index).unwrap().always_reachable = false;
 
-        reachability_graph.for_code.insert(new_fallthrough_target, Reachability::default());
+        let references = gather_references(&all_blocks[current.index()]);
+        *all_blocks[current.index()].next.instruction.fallthrough_target_mut().unwrap() = new_block_index;
         update_references(all_blocks, reachability_graph, None, current, references);
-
-        new_used_blocks.push(new_fallthrough_target);
     }
 
     new_used_blocks
@@ -4083,6 +5118,10 @@ fn merge_consecutive_fallthrough_blocks(
         }
 
         let current_reachability = reachability_graph.for_code.get_mut(&current).unwrap();
+        if current_reachability.always_reachable_or_exported() {
+            continue;
+        }
+
         let referenced_by_code: BTreeSet<BlockTarget> = current_reachability
             .reachable_from
             .iter()
@@ -4148,7 +5187,11 @@ fn merge_consecutive_fallthrough_blocks(
             remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, None, section_index);
         }
 
-        assert!(!reachability_graph.is_code_reachable(current));
+        assert!(
+            !reachability_graph.is_code_reachable(current),
+            "block {current:?} still reachable: {:#?}",
+            reachability_graph.for_code.get(&current)
+        );
         removed.insert(current);
     }
 
@@ -4442,11 +5485,9 @@ fn spill_fake_registers(
                         if src_reg == dst_reg {
                             continue;
                         }
-                        BasicInst::AnyAny {
-                            kind: AnyAnyKind::Add,
+                        BasicInst::MoveReg {
                             dst: dst_reg,
-                            src1: src_reg.into(),
-                            src2: RegImm::Imm(0),
+                            src: src_reg,
                         }
                     }
                     // Won't be emitted according to `regalloc2` docs.
@@ -4583,14 +5624,17 @@ fn replace_immediates_with_registers(
     }
 }
 
-fn harvest_all_jump_targets(
-    elf: &Elf,
+fn harvest_all_jump_targets<H>(
+    elf: &Elf<H>,
     data_sections_set: &HashSet<SectionIndex>,
     code_sections_set: &HashSet<SectionIndex>,
     instructions: &[(Source, InstExt<SectionTarget, SectionTarget>)],
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     exports: &[Export],
-) -> Result<HashSet<SectionTarget>, ProgramFromElfError> {
+) -> Result<HashSet<SectionTarget>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut all_jump_targets = HashSet::new();
     for (_, instruction) in instructions {
         match instruction {
@@ -4754,6 +5798,7 @@ struct Reachability {
     referenced_by_data: BTreeSet<SectionIndex>,
     always_reachable: bool,
     always_dynamically_reachable: bool,
+    exports: Vec<usize>,
 }
 
 impl Reachability {
@@ -4764,6 +5809,7 @@ impl Reachability {
             && self.address_taken_in.is_empty()
             && self.reachable_from.len() == 1
             && self.reachable_from.contains(&block_target)
+            && self.exports.is_empty()
     }
 
     fn is_unreachable(&self) -> bool {
@@ -4772,10 +5818,15 @@ impl Reachability {
             && self.referenced_by_data.is_empty()
             && !self.always_reachable
             && !self.always_dynamically_reachable
+            && self.exports.is_empty()
     }
 
     fn is_dynamically_reachable(&self) -> bool {
         !self.address_taken_in.is_empty() || !self.referenced_by_data.is_empty() || self.always_dynamically_reachable
+    }
+
+    fn always_reachable_or_exported(&self) -> bool {
+        self.always_reachable || !self.exports.is_empty()
     }
 }
 
@@ -4853,12 +5904,12 @@ fn calculate_reachability(
             .push(relocation);
     }
 
-    for export in exports {
+    for (export_index, export) in exports.iter().enumerate() {
         let Some(&block_target) = section_to_block.get(&export.location) else {
             return Err(ProgramFromElfError::other("export points to a non-block"));
         };
 
-        graph.for_code.entry(block_target).or_default().always_reachable = true;
+        graph.for_code.entry(block_target).or_default().exports.push(export_index);
         block_queue.push(block_target);
     }
 
@@ -5279,9 +6330,11 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_i8,
                             LoadKind::I16 => load_i16,
-                            LoadKind::U32 => load_u32,
+                            LoadKind::I32 => load_i32,
                             LoadKind::U8 => load_u8,
                             LoadKind::U16 => load_u16,
+                            LoadKind::U32 => load_u32,
+                            LoadKind::U64 => load_u64,
                         }
                     }
                 }
@@ -5293,6 +6346,7 @@ fn emit_code(
                                 args = (conv_reg(src), target),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_u64,
                                     StoreKind::U32 => store_u32,
                                     StoreKind::U16 => store_u16,
                                     StoreKind::U8 => store_u8,
@@ -5304,6 +6358,7 @@ fn emit_code(
                                 args = (target, value),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_imm_u64,
                                     StoreKind::U32 => store_imm_u32,
                                     StoreKind::U16 => store_imm_u16,
                                     StoreKind::U8 => store_imm_u8,
@@ -5319,9 +6374,11 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_indirect_i8,
                             LoadKind::I16 => load_indirect_i16,
-                            LoadKind::U32 => load_indirect_u32,
+                            LoadKind::I32 => load_indirect_i32,
                             LoadKind::U8 => load_indirect_u8,
                             LoadKind::U16 => load_indirect_u16,
+                            LoadKind::U32 => load_indirect_u32,
+                            LoadKind::U64 => load_indirect_u64,
                         }
                     }
                 }
@@ -5331,6 +6388,7 @@ fn emit_code(
                             args = (conv_reg(src), conv_reg(base), offset as u32),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_indirect_u64,
                                 StoreKind::U32 => store_indirect_u32,
                                 StoreKind::U16 => store_indirect_u16,
                                 StoreKind::U8 => store_indirect_u8,
@@ -5342,6 +6400,7 @@ fn emit_code(
                             args = (conv_reg(base), offset as u32, value),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_imm_indirect_u64,
                                 StoreKind::U32 => store_imm_indirect_u32,
                                 StoreKind::U16 => store_imm_indirect_u16,
                                 StoreKind::U8 => store_imm_indirect_u8,
@@ -5385,13 +6444,19 @@ fn emit_code(
                         kind = kind,
                         {
                             K::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
+                            K::MulUpperSignedUnsigned64 => mul_upper_signed_unsigned_64,
                             K::Div => div_signed,
+                            K::Div64 => div_signed_64,
                             K::DivUnsigned => div_unsigned,
+                            K::DivUnsigned64 => div_unsigned_64,
                             K::Rem => rem_signed,
+                            K::Rem64 => rem_signed_64,
                             K::RemUnsigned => rem_unsigned,
+                            K::RemUnsigned64 => rem_unsigned_64,
                         }
                     }
                 }
+                BasicInst::MoveReg { dst, src } => Instruction::move_reg(conv_reg(dst), conv_reg(src)),
                 BasicInst::AnyAny { kind, dst, src1, src2 } => {
                     use AnyAnyKind as K;
                     use Instruction as I;
@@ -5403,64 +6468,106 @@ fn emit_code(
                                 kind = kind,
                                 {
                                     K::Add => add,
+                                    K::Add64 => add_64,
                                     K::Sub => sub,
+                                    K::Sub64 => sub_64,
                                     K::ShiftLogicalLeft => shift_logical_left,
+                                    K::ShiftLogicalLeft64 => shift_logical_left_64,
                                     K::SetLessThanSigned => set_less_than_signed,
+                                    K::SetLessThanSigned64 => set_less_than_signed_64,
                                     K::SetLessThanUnsigned => set_less_than_unsigned,
+                                    K::SetLessThanUnsigned64 => set_less_than_unsigned_64,
                                     K::Xor => xor,
+                                    K::Xor64 => xor_64,
                                     K::ShiftLogicalRight => shift_logical_right,
+                                    K::ShiftLogicalRight64 => shift_logical_right_64,
                                     K::ShiftArithmeticRight => shift_arithmetic_right,
+                                    K::ShiftArithmeticRight64 => shift_arithmetic_right_64,
                                     K::Or => or,
+                                    K::Or64 => or_64,
                                     K::And => and,
+                                    K::And64 => and_64,
                                     K::Mul => mul,
+                                    K::Mul64 => mul_64,
                                     K::MulUpperSignedSigned => mul_upper_signed_signed,
+                                    K::MulUpperSignedSigned64 => mul_upper_signed_signed_64,
                                     K::MulUpperUnsignedUnsigned => mul_upper_unsigned_unsigned,
+                                    K::MulUpperUnsignedUnsigned64 => mul_upper_unsigned_unsigned_64,
                                 }
                             }
                         }
                         (RegImm::Reg(src1), RegImm::Imm(src2)) => {
                             let src1 = conv_reg(src1);
                             match kind {
-                                K::Add if src2 == 0 => I::move_reg(dst, src1),
                                 K::Add => I::add_imm(dst, src1, src2),
+                                K::Add64 => I::add_64_imm(dst, src1, src2),
                                 K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
+                                K::Sub64 => I::add_64_imm(dst, src1, (-(src2 as i32)) as u32),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
+                                K::ShiftLogicalLeft64 => I::shift_logical_left_64_imm(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
+                                K::SetLessThanSigned64 => I::set_less_than_signed_64_imm(dst, src1, src2),
                                 K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
+                                K::SetLessThanUnsigned64 => I::set_less_than_unsigned_64_imm(dst, src1, src2),
                                 K::Xor => I::xor_imm(dst, src1, src2),
+                                K::Xor64 => I::xor_64_imm(dst, src1, src2),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
+                                K::ShiftLogicalRight64 => I::shift_logical_right_64_imm(dst, src1, src2),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
+                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_64_imm(dst, src1, src2),
                                 K::Or => I::or_imm(dst, src1, src2),
+                                K::Or64 => I::or_64_imm(dst, src1, src2),
                                 K::And => I::and_imm(dst, src1, src2),
+                                K::And64 => I::and_64_imm(dst, src1, src2),
                                 K::Mul => I::mul_imm(dst, src1, src2),
+                                K::Mul64 => I::mul_imm(dst, src1, src2),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
+                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm_64(dst, src1, src2),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
+                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm_64(dst, src1, src2),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Reg(src2)) => {
                             let src2 = conv_reg(src2);
                             match kind {
                                 K::Add => I::add_imm(dst, src2, src1),
+                                K::Add64 => I::add_64_imm(dst, src2, src1),
                                 K::Xor => I::xor_imm(dst, src2, src1),
+                                K::Xor64 => I::xor_64_imm(dst, src2, src1),
                                 K::Or => I::or_imm(dst, src2, src1),
+                                K::Or64 => I::or_64_imm(dst, src2, src1),
                                 K::And => I::and_imm(dst, src2, src1),
+                                K::And64 => I::and_64_imm(dst, src2, src1),
                                 K::Mul => I::mul_imm(dst, src2, src1),
+                                K::Mul64 => I::mul_imm(dst, src2, src1),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
+                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm_64(dst, src2, src1),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
+                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm_64(dst, src2, src1),
 
                                 K::Sub => I::negate_and_add_imm(dst, src2, src1),
+                                K::Sub64 => I::negate_and_add_imm(dst, src2, src1),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalLeft64 => I::shift_logical_left_64_imm_alt(dst, src2, src1),
                                 K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
+                                K::SetLessThanSigned64 => I::set_greater_than_signed_64_imm(dst, src2, src1),
                                 K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
+                                K::SetLessThanUnsigned64 => I::set_greater_than_unsigned_64_imm(dst, src2, src1),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalRight64 => I::shift_logical_right_imm_alt(dst, src2, src1),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_64_imm_alt(dst, src2, src1),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
                             if is_optimized {
                                 unreachable!("internal error: instruction with only constant operands: {op:?}")
                             } else {
-                                I::load_imm(dst, OperationKind::from(kind).apply_const(src1 as i32, src2 as i32) as u32)
+                                let imm: u32 = OperationKind::from(kind)
+                                    .apply_const(i32_to_i64(src1 as i32), i32_to_i64(src2 as i32))
+                                    .try_into()
+                                    .expect("load immediate overflow");
+                                I::load_imm(dst, imm)
                             }
                         }
                     }
@@ -5611,7 +6718,7 @@ fn emit_code(
                         if is_optimized {
                             unreachable!("internal error: branch with only constant operands")
                         } else {
-                            match OperationKind::from(kind).apply_const(src1 as i32, src2 as i32) {
+                            match OperationKind::from(kind).apply_const(i32_to_i64(src1 as i32), i32_to_i64(src2 as i32)) {
                                 1 => unconditional_jump(target_true),
                                 0 => {
                                     assert!(can_fallthrough_to_next_block.contains(block_target));
@@ -5637,12 +6744,23 @@ fn emit_code(
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Bitness {
     B32,
+    B64,
+}
+
+impl InstructionSet for Bitness {
+    fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
+        match self {
+            Bitness::B32 => polkavm_common::program::ISA32_V1.opcode_from_u8(byte),
+            Bitness::B64 => polkavm_common::program::ISA64_V1.opcode_from_u8(byte),
+        }
+    }
 }
 
 impl From<Bitness> for u64 {
     fn from(value: Bitness) -> Self {
         match value {
             Bitness::B32 => 4,
+            Bitness::B64 => 8,
         }
     }
 }
@@ -5651,6 +6769,7 @@ impl From<Bitness> for RelocationSize {
     fn from(value: Bitness) -> Self {
         match value {
             Bitness::B32 => RelocationSize::U32,
+            Bitness::B64 => RelocationSize::U64,
         }
     }
 }
@@ -5660,6 +6779,7 @@ pub(crate) enum RelocationSize {
     U8,
     U16,
     U32,
+    U64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -5706,12 +6826,15 @@ impl RelocationKind {
     }
 }
 
-fn harvest_data_relocations(
-    elf: &Elf,
+fn harvest_data_relocations<H>(
+    elf: &Elf<H>,
     code_sections_set: &HashSet<SectionIndex>,
     section: &Section,
     relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     #[derive(Debug)]
     enum MutOp {
         Add,
@@ -5764,6 +6887,18 @@ fn harvest_data_relocations(
                     }),
                 )
             }
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 64 =>
+            {
+                (
+                    "R_RISCV_64",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    }),
+                )
+            }
+
             (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
@@ -5786,9 +6921,12 @@ fn harvest_data_relocations(
                 object::elf::R_RISCV_ADD16 => ("R_RISCV_ADD16", Kind::Mut(MutOp::Add, RelocationSize::U16, target)),
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
+                object::elf::R_RISCV_ADD64 => ("R_RISCV_ADD64", Kind::Mut(MutOp::Add, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SUB64 => ("R_RISCV_SUB64", Kind::Mut(MutOp::Sub, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
                 object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
+
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5967,6 +7105,19 @@ fn test_overwrite_uleb128() {
     assert_eq!(data, encoded_value);
 }
 
+fn write_u64(data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
+    let value = value.to_le_bytes();
+    data[relative_address as usize + 7] = value[7];
+    data[relative_address as usize + 6] = value[6];
+    data[relative_address as usize + 5] = value[5];
+    data[relative_address as usize + 4] = value[4];
+    data[relative_address as usize + 3] = value[3];
+    data[relative_address as usize + 2] = value[2];
+    data[relative_address as usize + 1] = value[1];
+    data[relative_address as usize] = value[0];
+    Ok(())
+}
+
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
     let value = value.to_le_bytes();
     data[relative_address as usize + 3] = value[3];
@@ -5983,12 +7134,15 @@ fn write_u16(data: &mut [u8], relative_address: u64, value: u16) -> Result<(), P
     Ok(())
 }
 
-fn harvest_code_relocations(
-    elf: &Elf,
+fn harvest_code_relocations<H>(
+    elf: &Elf<H>,
     section: &Section,
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     data_relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     fn jump_or_call<T>(ra: RReg, target: T, target_return: T) -> Result<ControlInst<T>, ProgramFromElfError> {
         if let Some(ra) = cast_reg_non_zero(ra)? {
             Ok(ControlInst::Call { ra, target, target_return })
@@ -6062,6 +7216,17 @@ fn harvest_code_relocations(
                     },
                 );
             }
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 64 =>
+            {
+                data_relocations.insert(
+                    current_location,
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    },
+                );
+            }
             (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
@@ -6072,14 +7237,14 @@ fn harvest_code_relocations(
                         };
 
                         let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        let Some(hi_inst) = Inst::decode(hi_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
                             )));
                         };
 
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Some(lo_inst) = Inst::decode(lo_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
                             )));
@@ -6176,7 +7341,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_JAL => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6199,7 +7364,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_BRANCH => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6232,7 +7397,7 @@ fn harvest_code_relocations(
                     object::elf::R_RISCV_HI20 => {
                         // This relocation is for a LUI.
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6260,7 +7425,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_LO12_I => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6309,7 +7474,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_LO12_S => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_S for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6344,7 +7509,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_RVC_JUMP => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6367,7 +7532,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_RVC_BRANCH => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6420,10 +7585,10 @@ fn harvest_code_relocations(
     for (relative_lo, (lo_rel_name, relative_hi)) in pcrel_relocations.reloc_pcrel_lo12 {
         let lo_inst_raw = &section_data[relative_lo as usize..][..4];
         let lo_inst_raw = u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]);
-        let lo_inst = Inst::decode(lo_inst_raw);
+        let lo_inst = Inst::decode(lo_inst_raw, elf.is_64());
         let hi_inst_raw = &section_data[relative_hi as usize..][..4];
         let hi_inst_raw = u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]);
-        let hi_inst = Inst::decode(hi_inst_raw);
+        let hi_inst = Inst::decode(hi_inst_raw, elf.is_64());
 
         let Some((hi_kind, target)) = pcrel_relocations.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("{lo_rel_name} relocation at '{section_name}'0x{relative_lo:x} targets '{section_name}'0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20 or R_RISCV_GOT_HI20 relocation")));
@@ -6454,6 +7619,20 @@ fn harvest_code_relocations(
 
             match lo_inst {
                 Inst::Load {
+                    kind: LoadKind::U64,
+                    base,
+                    dst,
+                    ..
+                } if elf.is_64() => {
+                    let Some(dst) = cast_reg_non_zero(dst)? else {
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
+                    };
+
+                    (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
+                }
+                Inst::Load {
                     kind: LoadKind::U32,
                     base,
                     dst,
@@ -6480,7 +7659,21 @@ fn harvest_code_relocations(
                     src,
                     dst,
                     ..
-                } => {
+                } if !elf.is_64() => {
+                    let Some(dst) = cast_reg_non_zero(dst)? else {
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
+                    };
+
+                    (src, InstExt::Basic(BasicInst::LoadAddress { dst, target }))
+                }
+                Inst::RegImm {
+                    kind: RegImmKind::Add64,
+                    src,
+                    dst,
+                    ..
+                } if elf.is_64() => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
                         return Err(ProgramFromElfError::other(format!(
                             "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
@@ -6546,7 +7739,10 @@ fn harvest_code_relocations(
     Ok(())
 }
 
-fn parse_function_symbols(elf: &Elf) -> Result<Vec<(Source, String)>, ProgramFromElfError> {
+fn parse_function_symbols<H>(elf: &Elf<H>) -> Result<Vec<(Source, String)>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut functions = Vec::new();
     for sym in elf.symbols() {
         match sym.kind() {
@@ -6624,14 +7820,25 @@ impl Config {
 }
 
 pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramFromElfError> {
-    let mut elf = Elf::parse(data)?;
+    match Elf::<object::elf::FileHeader32<object::endian::LittleEndian>>::parse(data) {
+        Ok(elf) => program_from_elf_internal(config, elf),
+        Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
+            let elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
+            program_from_elf_internal(config, elf)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn program_from_elf_internal<H>(config: Config, mut elf: Elf<H>) -> Result<Vec<u8>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
+    let bitness = if elf.is_64() { Bitness::B64 } else { Bitness::B32 };
 
     if elf.section_by_name(".got").next().is_none() {
         elf.add_empty_data_section(".got");
     }
-
-    // TODO: 64-bit support.
-    let bitness = Bitness::B32;
 
     let mut sections_ro_data = Vec::new();
     let mut sections_rw_data = Vec::new();
@@ -6650,6 +7857,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".got.plt"
             || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
@@ -6737,7 +7945,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             extract_exports(&elf, &relocations, section)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let exports: Vec<_> = exports.into_iter().flatten().collect();
+    let mut exports: Vec<_> = exports.into_iter().flatten().collect();
 
     let mut instructions = Vec::new();
     let mut imports = Vec::new();
@@ -6808,7 +8016,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
     let mut regspill_size = 0;
     if config.optimize {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
-        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph);
+        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
         used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
         spill_fake_registers(
             section_regspill,
@@ -6845,6 +8053,19 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
             reachability.always_reachable = true;
             reachability.always_dynamically_reachable = true;
+        }
+
+        for (export_index, export) in exports.iter().enumerate() {
+            let Some(&block_target) = section_to_block.get(&export.location) else {
+                return Err(ProgramFromElfError::other("export points to a non-block"));
+            };
+
+            reachability_graph
+                .for_code
+                .entry(block_target)
+                .or_default()
+                .exports
+                .push(export_index);
         }
 
         used_blocks = (0..all_blocks.len()).map(BlockTarget::from_raw).collect();
@@ -6999,6 +8220,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
         fn write_generic(size: RelocationSize, data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
             match size {
+                RelocationSize::U64 => write_u64(data, relative_address, value),
                 RelocationSize::U32 => {
                     let Ok(value) = u32::try_from(value) else {
                         return Err(ProgramFromElfError::other(
@@ -7193,7 +8415,11 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
     log::trace!("Instruction count: {}", code.len());
 
-    let mut builder = ProgramBlobBuilder::new();
+    let mut builder = if elf.is_64() {
+        ProgramBlobBuilder::new_64bit()
+    } else {
+        ProgramBlobBuilder::new()
+    };
 
     builder.set_ro_data_size(memory_config.ro_data_size);
     builder.set_rw_data_size(memory_config.rw_data_size);
@@ -7243,16 +8469,18 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
         }
     }
 
-    for export in exports {
-        let &block_target = section_to_block
-            .get(&export.location)
-            .expect("internal error: export metadata has a non-block target location");
+    let mut export_count = 0;
+    for current in used_blocks {
+        for &export_index in &reachability_graph.for_code.get(&current).unwrap().exports {
+            let export = &exports[export_index];
+            let jump_target = jump_target_for_block[current.index()]
+                .expect("internal error: export metadata points to a block without a jump target assigned");
 
-        let jump_target = jump_target_for_block[block_target.index()]
-            .expect("internal error: export metadata points to a block without a jump target assigned");
-
-        builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+            builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+            export_count += 1;
+        }
     }
+    assert_eq!(export_count, exports.len());
 
     let mut locations_for_instruction: Vec<Option<Arc<[Location]>>> = Vec::with_capacity(code.len());
     let mut raw_code = Vec::with_capacity(code.len());
@@ -7330,8 +8558,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
     if !config.strip {
         let blob = ProgramBlob::parse(builder.to_vec().into())?;
         offsets = blob
-            .instructions()
-            .map(|instruction| (instruction.offset, instruction.next_offset()))
+            .instructions(bitness)
+            .map(|instruction| (instruction.offset, instruction.next_offset))
             .collect();
         assert_eq!(offsets.len(), locations_for_instruction.len());
 

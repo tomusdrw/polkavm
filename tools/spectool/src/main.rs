@@ -191,7 +191,7 @@ fn main_generate() {
     }
 }
 
-fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
+fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, String> {
     let name = path.file_stem().unwrap().to_string_lossy();
     let input = std::fs::read_to_string(&path).unwrap();
     let input = input.lines().collect::<Vec<_>>().join("\n");
