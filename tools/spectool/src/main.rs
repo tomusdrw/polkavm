@@ -4,9 +4,9 @@
 #![allow(clippy::use_debug)]
 
 use clap::Parser;
-use spectool::{prepare_input, Testcase};
 use core::fmt::Write;
 use polkavm::{Engine, Reg};
+use spectool::{prepare_input, Testcase};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -42,7 +42,7 @@ fn main_generate() {
     let mut found_errors = false;
     for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let path = entry.unwrap().path();
-        let test_case = prepare_file(&engine, &*path);
+        let test_case = prepare_file(&engine, &path);
         if let Ok(test_case) = test_case {
             tests.push(test_case);
         } else {
@@ -191,9 +191,9 @@ fn main_generate() {
     }
 }
 
-fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, ()> {
+fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, String> {
     let name = path.file_stem().unwrap().to_string_lossy();
-    let input = std::fs::read_to_string(&path).unwrap();
+    let input = std::fs::read_to_string(path).unwrap();
     let input = input.lines().collect::<Vec<_>>().join("\n");
     prepare_input(&input, engine, &name, true)
 }

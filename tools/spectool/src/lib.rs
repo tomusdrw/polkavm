@@ -67,29 +67,20 @@ pub fn new_engine() -> Engine {
     Engine::new(&config).unwrap()
 }
 
-pub fn prepare_input(
-    input: &str,
-    engine: &Engine,
-    name: &str,
-    execute: bool,
-) -> Result<Testcase, String> {
-    let mut initial_regs = [0; 13];
-    let mut initial_gas = 10000;
+pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) -> Result<Testcase, String> {
+    let mut pre = PrePost::default();
+    let mut post = PrePost::default();
 
     let mut input_lines = Vec::new();
     for line in input.lines() {
         if let Some(line) = line.strip_prefix("pre:") {
-            let line = line.trim();
-            let index = line.find('=').expect("invalid 'pre' directive: no '=' found");
-            let lhs = line[..index].trim();
-            let rhs = line[index + 1..].trim();
-            if lhs == "gas" {
-                initial_gas = rhs.parse::<i64>().expect("invalid 'pre' directive: failed to parse rhs");
-            } else {
-                let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' directive: failed to parse lhs");
-                let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' directive: failed to parse rhs");
-                initial_regs[lhs as usize] = rhs as u32;
-            }
+            parse_pre_post(line, &mut pre);
+            input_lines.push(""); // Insert dummy line to not mess up the line count.
+            continue;
+        }
+
+        if let Some(line) = line.strip_prefix("post:") {
+            parse_pre_post(line, &mut post);
             input_lines.push(""); // Insert dummy line to not mess up the line count.
             continue;
         }
@@ -97,13 +88,15 @@ pub fn prepare_input(
         input_lines.push(line);
     }
 
+    let initial_gas = pre.gas.unwrap_or(10000);
+    let initial_regs = pre.regs.map(|value| value.unwrap_or(0));
+    assert!(pre.pc.is_none(), "'pre: pc = ...' is currently unsupported");
+
     let input = input_lines.join("\n");
-    println!("Input: {}", input);
     let blob = match assemble(&input) {
         Ok(blob) => blob,
         Err(error) => {
             let msg = format!("Failed to assemble {name:?}: {error}");
-            eprintln!("{}", msg);
             return Err(msg);
         }
     };
@@ -116,7 +109,7 @@ pub fn prepare_input(
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
     module_config.set_step_tracing(true);
 
-    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+    let module = Module::from_blob(engine, &module_config, blob.clone()).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
@@ -150,17 +143,36 @@ pub fn prepare_input(
         });
     }
 
-    let initial_pc = blob.exports()
-        .find(|export| export.symbol() == "main")
-        .map(|x| x.program_counter())
-        .unwrap_or(ProgramCounter(0));
-
-    #[allow(clippy::map_unwrap_or)]
-    let expected_final_pc = blob
+    let initial_pc = blob
         .exports()
-        .find(|export| export.symbol() == "expected_exit")
-        .map(|export| export.program_counter().0)
-        .unwrap_or(blob.code().len() as u32);
+        .find(|export| export.symbol() == "main")
+        .map_or(ProgramCounter(0), |x| x.program_counter());
+
+    let expected_final_pc = if let Some(export) = blob.exports().find(|export| export.symbol() == "expected_exit") {
+        assert!(
+            post.pc.is_none(),
+            "'@expected_exit' label and 'post: pc = ...' should not be used together"
+        );
+        export.program_counter().0
+    } else if let Some((label, nth_instruction)) = post.pc {
+        let Some(export) = blob.exports().find(|export| export.symbol().as_bytes() == label.as_bytes()) else {
+            panic!("label specified in 'post: pc = ...' is missing: @{label}");
+        };
+
+        let instructions: Vec<_> = blob
+            .instructions(polkavm_common::program::DefaultInstructionSet::default())
+            .collect();
+        let index = instructions
+            .iter()
+            .position(|inst| inst.offset == export.program_counter())
+            .expect("failed to find label specified in 'post: pc = ...'");
+        let instruction = instructions
+            .get(index + nth_instruction as usize)
+            .expect("invalid 'post: pc = ...': offset goes out of bounds of the basic block");
+        instruction.offset.0
+    } else {
+        blob.code().len() as u32
+    };
 
     instance.set_gas(initial_gas);
     instance.set_next_program_counter(initial_pc);
@@ -223,7 +235,6 @@ pub fn prepare_input(
     disassembler.disassemble_into(&mut disassembly).unwrap();
     let disassembly = String::from_utf8(disassembly).unwrap();
 
-
     Ok(Testcase {
         disassembly,
         json: TestcaseJson {
@@ -243,7 +254,49 @@ pub fn prepare_input(
     })
 }
 
-fn to_string<E: std::fmt::Debug>(e: E) -> String {
+#[derive(Default)]
+struct PrePost {
+    gas: Option<i64>,
+    regs: [Option<u32>; 13],
+    pc: Option<(String, u32)>,
+}
+
+fn parse_pre_post(line: &str, output: &mut PrePost) {
+    let line = line.trim();
+    let index = line.find('=').expect("invalid 'pre' / 'post' directive: no '=' found");
+    let lhs = line[..index].trim();
+    let rhs = line[index + 1..].trim();
+    if lhs == "gas" {
+        output.gas = Some(rhs.parse::<i64>().expect("invalid 'pre' / 'post' directive: failed to parse rhs"));
+    } else if lhs == "pc" {
+        let rhs = rhs
+            .strip_prefix('@')
+            .expect("invalid 'pre' / 'post' directive: failed to parse 'pc': no '@' found")
+            .trim();
+        let index = rhs
+            .find('[')
+            .expect("invalid 'pre' / 'post' directive: failed to parse 'pc': no '[' found");
+        let label = &rhs[..index];
+        let rhs = &rhs[index + 1..];
+        let index = rhs
+            .find(']')
+            .expect("invalid 'pre' / 'post' directive: failed to parse 'pc': no ']' found");
+        let offset = rhs[..index]
+            .parse::<u32>()
+            .expect("invalid 'pre' / 'post' directive: failed to parse 'pc': invalid offset");
+        if !rhs[index + 1..].trim().is_empty() {
+            panic!("invalid 'pre' / 'post' directive: failed to parse 'pc': junk after ']'");
+        }
+
+        output.pc = Some((label.to_owned(), offset));
+    } else {
+        let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' / 'post' directive: failed to parse lhs");
+        let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' / 'post' directive: failed to parse rhs");
+        output.regs[lhs as usize] = Some(rhs as u32);
+    }
+}
+
+fn to_string<E: core::fmt::Debug>(e: E) -> String {
     format!("{:?}", e)
 }
 
@@ -252,7 +305,8 @@ pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
     parts.code_and_jump_table = bytecode.into();
     let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
 
-    let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+    let mut disassembler =
+        polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
     disassembler.show_raw_bytes(false);
     disassembler.prefer_non_abi_reg_names(true);
     disassembler.prefer_unaliased(false);

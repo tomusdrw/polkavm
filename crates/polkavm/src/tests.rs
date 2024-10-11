@@ -10,10 +10,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use polkavm_common::abi::MemoryMapBuilder;
-use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
+use polkavm_common::program::{asm, DefaultInstructionSet};
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
+
+use paste::paste;
 
 fn get_native_page_size() -> usize {
     if_compiler_is_supported! {
@@ -24,77 +26,88 @@ fn get_native_page_size() -> usize {
 macro_rules! run_tests {
     ($($test_name:ident)+) => {
         if_compiler_is_supported! {
-            mod compiler {
-                #[cfg(target_os = "linux")]
-                mod linux {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_worker_count(1);
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Linux));
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(target_os = "linux")]
-                mod linux_tracing {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Linux));
-                            config.set_allow_experimental(true);
-                            config.set_crosscheck(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(feature = "generic-sandbox")]
-                mod generic {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Generic));
-                            config.set_allow_experimental(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(feature = "generic-sandbox")]
-                mod generic_tracing {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Generic));
-                            config.set_allow_experimental(true);
-                            config.set_crosscheck(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-            }
-        }
-
-        mod interpreter {
             $(
-                #[test]
-                fn $test_name() {
-                    let mut config = crate::Config::default();
-                    config.set_backend(Some(crate::BackendKind::Interpreter));
-                    super::$test_name(config);
+                paste! {
+                    #[cfg(target_os = "linux")]
+                    #[test]
+                    fn [<compiler_linux_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_worker_count(1);
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Linux));
+                        $test_name(config);
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    #[test]
+                    fn [<tracing_linux_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Linux));
+                        config.set_allow_experimental(true);
+                        config.set_crosscheck(true);
+                        $test_name(config);
+                    }
+
+                    #[cfg(feature = "generic-sandbox")]
+                    #[test]
+                    fn [<compiler_generic_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Generic));
+                        config.set_allow_experimental(true);
+                        $test_name(config);
+                    }
+
+                    #[cfg(feature = "generic-sandbox")]
+                    #[test]
+                    fn [<tracing_generic_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Generic));
+                        config.set_allow_experimental(true);
+                        config.set_crosscheck(true);
+                        $test_name(config);
+                    }
                 }
             )+
         }
+
+        $(
+            paste! {
+                #[test]
+                fn [<interpreter_ $test_name>]() {
+                    let mut config = crate::Config::default();
+                    config.set_backend(Some(crate::BackendKind::Interpreter));
+                    $test_name(config);
+                }
+            }
+        )+
+    }
+}
+
+macro_rules! run_test_blob_tests {
+    ($($test_name:ident)+) => {
+        paste! {
+            run_tests! {
+                $([<optimized_ $test_name>])+
+            }
+        }
+
+        $(
+            paste! {
+                fn [<optimized_ $test_name>](config: Config) {
+                    $test_name(config, true)
+                }
+
+                #[test]
+                fn [<interpreter_unoptimized_ $test_name>]() {
+                    let mut config = crate::Config::default();
+                    config.set_backend(Some(crate::BackendKind::Interpreter));
+                    $test_name(config, false);
+                }
+            }
+        )+
     }
 }
 
@@ -204,7 +217,7 @@ fn step_tracing_basic(engine_config: Config) {
     let entry_point = module.exports().find(|export| export == "main").unwrap().program_counter();
     assert_eq!(entry_point.0, 0);
 
-    let list: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().collect();
+    let list: Vec<_> = module.blob().instructions(DefaultInstructionSet::default()).collect();
     let address = module.memory_map().rw_data_address();
 
     instance.prepare_call_typed(entry_point, (1, 10));
@@ -235,7 +248,7 @@ fn step_tracing_basic(engine_config: Config) {
 
     match_interrupt!(instance.run().unwrap(), InterruptKind::Ecalli(0));
     assert_eq!(instance.program_counter(), Some(list[2].offset));
-    assert_eq!(instance.next_program_counter(), Some(list[2].next_offset()));
+    assert_eq!(instance.next_program_counter(), Some(list[2].next_offset));
     instance.set_reg(Reg::A0, 100);
 
     match_interrupt!(instance.run().unwrap(), InterruptKind::Step);
@@ -346,7 +359,11 @@ fn step_tracing_out_of_gas(engine_config: Config) {
 
     let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
     let module = Module::from_blob(&engine, &config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
     let mut instance = module.instantiate().unwrap();
 
     instance.set_gas(2);
@@ -416,7 +433,11 @@ fn zero_memory(engine_config: Config) {
 
     let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
     let module = Module::from_blob(&engine, &ModuleConfig::new(), blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_next_program_counter(offsets[0]);
@@ -453,7 +474,11 @@ fn dynamic_jump_to_null(engine_config: Config) {
 
         let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
         let module = Module::from_blob(&engine, &ModuleConfig::new(), blob).unwrap();
-        let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+        let offsets: Vec<_> = module
+            .blob()
+            .instructions(DefaultInstructionSet::default())
+            .map(|inst| inst.offset)
+            .collect();
 
         let mut instance = module.instantiate().unwrap();
         instance.set_next_program_counter(offsets[0]);
@@ -461,6 +486,168 @@ fn dynamic_jump_to_null(engine_config: Config) {
         assert_eq!(instance.program_counter(), Some(offsets[1]));
         assert_eq!(instance.next_program_counter(), None);
     }
+}
+
+fn jump_into_middle_of_basic_block_from_outside(engine_config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&engine_config).unwrap();
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::add_imm(A0, A0, 2),
+            asm::add_imm(A0, A0, 4),
+            asm::add_imm(A0, A0, 8),
+            asm::add_imm(A0, A0, 16),
+            asm::ret(),
+        ],
+        &[],
+    );
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config: ModuleConfig = ModuleConfig::new();
+    module_config.set_page_size(get_native_page_size().try_into().unwrap());
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_gas(1000);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_next_program_counter(offsets[4]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 0);
+    assert_eq!(instance.gas(), 1000);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_next_program_counter(offsets[3]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 16);
+    assert_eq!(instance.gas(), 1000);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_next_program_counter(offsets[1]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 4 + 8 + 16);
+    assert_eq!(instance.gas(), 1000);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_next_program_counter(offsets[2]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 8 + 16);
+    assert_eq!(instance.gas(), 1000);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_next_program_counter(offsets[0]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 2 + 4 + 8 + 16);
+    assert_eq!(instance.gas(), 995);
+}
+
+fn jump_into_middle_of_basic_block_from_within(engine_config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&engine_config).unwrap();
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::jump(1), asm::add_imm(A0, A0, 100), asm::ret()], &[]);
+
+    let mut blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+
+    // First, sanity check: does this program execute correctly as-is?
+    let instructions = {
+        let mut module_config: ModuleConfig = ModuleConfig::new();
+        module_config.set_page_size(get_native_page_size().try_into().unwrap());
+        module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+        let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+        let instructions: Vec<_> = module.blob().instructions(DefaultInstructionSet::default()).collect();
+
+        let mut instance = module.instantiate().unwrap();
+        instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+        instance.set_gas(1000);
+
+        instance.set_next_program_counter(instructions[0].offset);
+        match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+        assert_eq!(instance.reg(Reg::A0), 100);
+        assert_eq!(instance.gas(), 997);
+        instructions
+    };
+
+    use polkavm_common::program::{Instruction, ParsedInstruction};
+
+    // Then, let's patch the code to jump somewhere invalid.
+    assert_eq!(
+        instructions[0],
+        ParsedInstruction {
+            kind: Instruction::jump(instructions[1].offset.0),
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(2)
+        }
+    );
+    assert_eq!(instructions[2].kind, asm::ret());
+
+    // Patch the jump so that it jumps after the `add_imm`/before the `ret`.
+    let mut raw_code = blob.code().to_vec();
+    raw_code[1] = (instructions[2].offset.0 - instructions[0].offset.0) as u8;
+
+    blob.set_code(raw_code.into());
+    let new_instructions: Vec<_> = blob.instructions(DefaultInstructionSet::default()).collect();
+    assert_eq!(&instructions[1..], &new_instructions[1..]);
+    assert_eq!(new_instructions[0].kind, asm::jump(new_instructions[2].offset.0));
+
+    let mut module_config: ModuleConfig = ModuleConfig::new();
+    module_config.set_page_size(get_native_page_size().try_into().unwrap());
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+    let instructions: Vec<_> = module.blob().instructions(DefaultInstructionSet::default()).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_gas(1000);
+
+    instance.set_next_program_counter(instructions[0].offset);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.gas(), 999);
+}
+
+fn jump_after_invalid_instruction_from_within(engine_config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&engine_config).unwrap();
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::trap(), asm::add_imm(A0, A0, 100), asm::jump(1)], &[]);
+
+    let mut blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut raw_code = blob.code().to_vec();
+    raw_code[0] = 255;
+    blob.set_code(raw_code.into());
+    let instructions: Vec<_> = blob.instructions(DefaultInstructionSet::default()).collect();
+    assert_eq!(
+        instructions[0],
+        polkavm_common::program::ParsedInstruction {
+            kind: crate::program::Instruction::invalid,
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(1),
+        }
+    );
+
+    let mut module_config: ModuleConfig = ModuleConfig::new();
+    module_config.set_page_size(get_native_page_size().try_into().unwrap());
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_gas(1000);
+
+    instance.set_next_program_counter(instructions[1].offset);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.gas(), 998);
 }
 
 fn dynamic_paging_basic(mut engine_config: Config) {
@@ -489,7 +676,11 @@ fn dynamic_paging_basic(mut engine_config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -555,7 +746,11 @@ fn dynamic_paging_freeing_pages(mut engine_config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -599,7 +794,11 @@ fn dynamic_paging_stress_test(mut engine_config: Config) {
                 module_config.set_page_size(page_size);
                 module_config.set_dynamic_paging(true);
                 let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-                let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+                let offsets: Vec<_> = module
+                    .blob()
+                    .instructions(DefaultInstructionSet::default())
+                    .map(|inst| inst.offset)
+                    .collect();
 
                 let mut instance = module.instantiate().unwrap();
                 instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -640,7 +839,11 @@ fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -675,7 +878,11 @@ fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -700,7 +907,11 @@ fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) 
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -729,7 +940,11 @@ fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -758,7 +973,11 @@ fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -792,7 +1011,11 @@ fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Conf
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -824,7 +1047,11 @@ fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Con
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -856,7 +1083,11 @@ fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_co
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -888,7 +1119,11 @@ fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config)
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.zero_memory(0x11000, page_size).unwrap();
@@ -1031,7 +1266,11 @@ fn dynamic_paging_change_program_counter_during_segfault(mut engine_config: Conf
     module_config.set_page_size(page_size);
     module_config.set_dynamic_paging(true);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
@@ -1068,6 +1307,14 @@ fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
 static BLOB_MAP: Mutex<Option<BTreeMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
 
 fn get_blob(elf: &'static [u8]) -> ProgramBlob {
+    get_blob_impl(true, elf)
+}
+
+fn get_blob_unoptimized(elf: &'static [u8]) -> ProgramBlob {
+    get_blob_impl(false, elf)
+}
+
+fn get_blob_impl(optimize: bool, elf: &'static [u8]) -> ProgramBlob {
     let mut blob_map = BLOB_MAP.lock();
     let blob_map = blob_map.get_or_insert_with(BTreeMap::new);
     blob_map
@@ -1075,7 +1322,10 @@ fn get_blob(elf: &'static [u8]) -> ProgramBlob {
         .or_insert_with(|| {
             // This is slow, so cache it.
             let elf = decompress_zstd(elf);
-            let bytes = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
+            let mut config = polkavm_linker::Config::default();
+            config.set_optimize(optimize);
+
+            let bytes = polkavm_linker::program_from_elf(config, &elf).unwrap();
             ProgramBlob::parse(bytes.into()).unwrap()
         })
         .clone()
@@ -1285,7 +1535,11 @@ fn dispatch_table(config: Config) {
     let mut module_config = ModuleConfig::new();
     module_config.set_page_size(page_size);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
     assert_eq!(offsets[0], ProgramCounter(0));
     assert_eq!(offsets[1], ProgramCounter(5));
     assert_eq!(offsets[2], ProgramCounter(10));
@@ -1306,6 +1560,56 @@ fn dispatch_table(config: Config) {
     assert_eq!(instance.reg(Reg::A0), 11);
 }
 
+fn fallthrough_into_already_compiled_block(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::jump(2),
+            asm::add_imm(A0, A0, 2),
+            asm::fallthrough(),
+            asm::add_imm(A0, A0, 4),
+            asm::ret(),
+        ],
+        &[],
+    );
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let offsets: Vec<_> = blob
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
+
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_gas(1000);
+    instance.set_next_program_counter(offsets[0]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 4);
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_gas(1000);
+    instance.set_next_program_counter(offsets[1]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 6);
+    let gas = instance.gas();
+
+    instance.set_reg(Reg::A0, 0);
+    instance.set_gas(1000);
+    instance.set_next_program_counter(offsets[1]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 6);
+    assert_eq!(gas, instance.gas());
+}
+
 fn implicit_trap_after_fallthrough(config: Config) {
     let _ = env_logger::try_init();
     let engine = Engine::new(&config).unwrap();
@@ -1323,6 +1627,46 @@ fn implicit_trap_after_fallthrough(config: Config) {
     instance.set_next_program_counter(ProgramCounter(0));
     match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
     assert_eq!(instance.program_counter().unwrap().0, 1);
+    assert_eq!(instance.next_program_counter(), None);
+}
+
+fn invalid_instruction_after_fallthrough(engine_config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&engine_config).unwrap();
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::fallthrough(), asm::fallthrough(), asm::ret()], &[]);
+
+    let mut blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let instructions: Vec<_> = blob.instructions(DefaultInstructionSet::default()).collect();
+
+    let mut raw_code = blob.code().to_vec();
+    raw_code[instructions[1].offset.0 as usize] = 255;
+    blob.set_code(raw_code.into());
+
+    let instructions: Vec<_> = blob.instructions(DefaultInstructionSet::default()).collect();
+    assert_eq!(
+        instructions[1],
+        polkavm_common::program::ParsedInstruction {
+            kind: crate::program::Instruction::invalid,
+            offset: ProgramCounter(1),
+            next_offset: ProgramCounter(2),
+        }
+    );
+
+    let mut module_config: ModuleConfig = ModuleConfig::new();
+    module_config.set_page_size(get_native_page_size().try_into().unwrap());
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_gas(1000);
+
+    instance.set_next_program_counter(instructions[0].offset);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.gas(), 998);
+    assert_eq!(instance.program_counter().unwrap(), instructions[1].offset);
     assert_eq!(instance.next_program_counter(), None);
 }
 
@@ -1346,7 +1690,11 @@ fn aux_data_works(config: Config) {
     module_config.set_page_size(page_size);
     module_config.set_aux_data_size(1);
     let module = Module::from_blob(&engine, &module_config, blob).unwrap();
-    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    let offsets: Vec<_> = module
+        .blob()
+        .instructions(DefaultInstructionSet::default())
+        .map(|inst| inst.offset)
+        .collect();
 
     let mut instance = module.instantiate().unwrap();
     instance.write_u32(module.memory_map().aux_data_address(), 0x12345678).unwrap();
@@ -1445,6 +1793,42 @@ fn access_memory_from_host(config: Config) {
     assert!(instance.zero_memory(0xffffffff, 0).is_ok());
 }
 
+fn sbrk_knob_works(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::sbrk(Reg::A0, Reg::A0), asm::ret()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+
+    for sbrk_allowed in [true, false] {
+        let mut module_config: ModuleConfig = ModuleConfig::new();
+        module_config.set_page_size(page_size);
+        module_config.set_allow_sbrk(sbrk_allowed);
+        module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+        let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+
+        let mut instance = module.instantiate().unwrap();
+        instance.set_reg(Reg::A0, 0);
+        instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+
+        instance.set_gas(5);
+        instance.set_next_program_counter(ProgramCounter(0));
+
+        #[allow(clippy::branches_sharing_code)]
+        if sbrk_allowed {
+            match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+            assert_eq!(instance.gas(), 3);
+        } else {
+            match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+            assert_eq!(instance.program_counter(), Some(ProgramCounter(0)));
+            assert_eq!(instance.gas(), 4);
+        }
+    }
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -1453,9 +1837,13 @@ struct TestInstance {
 const TEST_BLOB_ELF_ZST: &[u8] = include_bytes!("../../../test-data/test-blob.elf.zst");
 
 impl TestInstance {
-    fn new(config: &Config) -> Self {
+    fn new(config: &Config, optimize: bool) -> Self {
         let _ = env_logger::try_init();
-        let blob = get_blob(TEST_BLOB_ELF_ZST);
+        let blob = if optimize {
+            get_blob(TEST_BLOB_ELF_ZST)
+        } else {
+            get_blob_unoptimized(TEST_BLOB_ELF_ZST)
+        };
 
         let engine = Engine::new(config).unwrap();
         let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
@@ -1503,15 +1891,15 @@ impl TestInstance {
     }
 }
 
-fn test_blob_basic_test(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_basic_test(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 1);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 2);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 3);
 }
 
-fn test_blob_atomic_fetch_add(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_atomic_fetch_add(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 0);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 1);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 2);
@@ -1521,14 +1909,14 @@ fn test_blob_atomic_fetch_add(config: Config) {
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (0,)).unwrap(), 5);
 }
 
-fn test_blob_atomic_fetch_swap(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_atomic_fetch_swap(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (10,)).unwrap(), 0);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (100,)).unwrap(), 10);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (1000,)).unwrap(), 100);
 }
 
-fn test_blob_atomic_fetch_minmax(config: Config) {
+fn test_blob_atomic_fetch_minmax(config: Config, optimize: bool) {
     use core::cmp::{max, min};
 
     fn maxu(a: i32, b: i32) -> i32 {
@@ -1547,7 +1935,7 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
         ("atomic_fetch_min_unsigned", minu),
     ];
 
-    let mut i = TestInstance::new(&config);
+    let mut i = TestInstance::new(&config, optimize);
     for (name, cb) in list {
         for a in [-10, 0, 10] {
             for b in [-10, 0, 10] {
@@ -1560,35 +1948,37 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
     }
 }
 
-fn test_blob_hostcall(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_hostcall(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("test_multiply_by_6", (10,)).unwrap(), 60);
 }
 
-fn test_blob_define_abi(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_define_abi(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert!(i.call::<(), ()>("test_define_abi", ()).is_ok());
 }
 
-fn test_blob_input_registers(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_input_registers(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert!(i.call::<(), ()>("test_input_registers", ()).is_ok());
 }
 
-fn test_blob_call_sbrk_from_guest(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk", (size,)).unwrap())
+fn test_blob_call_sbrk_from_guest(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| i.call::<(u32,), u32>("call_sbrk", (size,)).unwrap())
 }
 
-fn test_blob_call_sbrk_from_host_instance(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.instance.sbrk(size).unwrap().unwrap_or(0))
+fn test_blob_call_sbrk_from_host_instance(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| i.instance.sbrk(size).unwrap().unwrap_or(0))
 }
 
-fn test_blob_call_sbrk_from_host_function(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk_indirectly", (size,)).unwrap())
+fn test_blob_call_sbrk_from_host_function(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| {
+        i.call::<(u32,), u32>("call_sbrk_indirectly", (size,)).unwrap()
+    })
 }
 
-fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_program_memory_can_be_reused_and_cleared(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     let address = i.call::<(), u32>("get_global_address", ()).unwrap();
 
     assert_eq!(i.instance.read_memory(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
@@ -1606,8 +1996,8 @@ fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
     assert_eq!(i.instance.read_memory(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
 }
 
-fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     let address = i.call::<(), u32>("get_global_address", ()).unwrap();
     assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 0);
     i.call::<(), ()>("increment_global", ()).unwrap();
@@ -1619,8 +2009,8 @@ fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
     assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 2);
 }
 
-fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestInstance, u32) -> u32) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_call_sbrk_impl(config: Config, optimize: bool, mut call_sbrk: impl FnMut(&mut TestInstance, u32) -> u32) {
+    let mut i = TestInstance::new(&config, optimize);
     let memory_map = i.module.memory_map().clone();
     let heap_base = memory_map.heap_base();
     let page_size = memory_map.page_size();
@@ -2004,6 +2394,60 @@ fn spawn_stress_test(mut config: Config) {
     }
 }
 
+#[cfg(not(feature = "module-cache"))]
+fn module_cache(_config: Config) {}
+
+#[cfg(feature = "module-cache")]
+fn module_cache(mut config: Config) {
+    let _ = env_logger::try_init();
+    let blob = get_blob(TEST_BLOB_ELF_ZST);
+
+    config.set_worker_count(0);
+
+    config.set_cache_enabled(true);
+    config.set_lru_cache_size(0);
+    let engine_with_cache = Engine::new(&config).unwrap();
+
+    config.set_cache_enabled(true);
+    config.set_lru_cache_size(1);
+    let engine_with_lru_cache = Engine::new(&config).unwrap();
+
+    config.set_cache_enabled(false);
+    config.set_lru_cache_size(0);
+    let engine_without_cache = Engine::new(&config).unwrap();
+
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_none());
+    let module_with_cache_1 = Module::from_blob(&engine_with_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+    let module_with_cache_2 = Module::from_blob(&engine_with_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+
+    assert!(Module::from_cache(&engine_without_cache, &Default::default(), &blob).is_none());
+    let module_without_cache_1 = Module::from_blob(&engine_without_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_without_cache, &Default::default(), &blob).is_none());
+    let module_without_cache_2 = Module::from_blob(&engine_without_cache, &Default::default(), blob.clone()).unwrap();
+
+    if engine_with_cache.backend() == BackendKind::Compiler {
+        assert_eq!(
+            module_with_cache_1.machine_code().unwrap().as_ptr(),
+            module_with_cache_2.machine_code().unwrap().as_ptr()
+        );
+        assert_ne!(
+            module_without_cache_1.machine_code().unwrap().as_ptr(),
+            module_without_cache_2.machine_code().unwrap().as_ptr()
+        );
+    }
+
+    core::mem::drop(module_with_cache_2);
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+    core::mem::drop(module_with_cache_1);
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_none());
+
+    assert!(Module::from_cache(&engine_with_lru_cache, &Default::default(), &blob).is_none());
+    Module::from_blob(&engine_with_lru_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_lru_cache, &Default::default(), &blob).is_some());
+}
+
 run_tests! {
     basic_test
     fallback_hostcall_handler_works
@@ -2012,6 +2456,9 @@ run_tests! {
     step_tracing_invalid_load
     step_tracing_out_of_gas
     dynamic_jump_to_null
+    jump_into_middle_of_basic_block_from_outside
+    jump_into_middle_of_basic_block_from_within
+    jump_after_invalid_instruction_from_within
     dynamic_paging_basic
     dynamic_paging_freeing_pages
     dynamic_paging_stress_test
@@ -2034,10 +2481,25 @@ run_tests! {
     pinky_standard
     pinky_dynamic_paging
     dispatch_table
+    fallthrough_into_already_compiled_block
     implicit_trap_after_fallthrough
+    invalid_instruction_after_fallthrough
     aux_data_works
     access_memory_from_host
+    sbrk_knob_works
 
+    basic_gas_metering_sync
+    basic_gas_metering_async
+    consume_gas_in_host_function_sync
+    consume_gas_in_host_function_async
+    gas_metering_with_more_than_one_basic_block
+    gas_metering_with_implicit_trap
+
+    spawn_stress_test
+    module_cache
+}
+
+run_test_blob_tests! {
     test_blob_basic_test
     test_blob_atomic_fetch_add
     test_blob_atomic_fetch_swap
@@ -2050,15 +2512,6 @@ run_tests! {
     test_blob_call_sbrk_from_host_function
     test_blob_program_memory_can_be_reused_and_cleared
     test_blob_out_of_bounds_memory_access_generates_a_trap
-
-    basic_gas_metering_sync
-    basic_gas_metering_async
-    consume_gas_in_host_function_sync
-    consume_gas_in_host_function_async
-    gas_metering_with_more_than_one_basic_block
-    gas_metering_with_implicit_trap
-
-    spawn_stress_test
 }
 
 macro_rules! assert_impl {
