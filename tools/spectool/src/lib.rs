@@ -109,7 +109,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
     module_config.set_step_tracing(true);
 
-    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+    let module = Module::from_blob(engine, &module_config, blob.clone()).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
@@ -293,7 +293,7 @@ fn parse_pre_post(line: &str, output: &mut PrePost) {
     }
 }
 
-fn to_string<E: std::fmt::Debug>(e: E) -> String {
+fn to_string<E: core::fmt::Debug>(e: E) -> String {
     format!("{:?}", e)
 }
 
