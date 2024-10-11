@@ -143,7 +143,8 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
         });
     }
 
-    let initial_pc = blob.exports()
+    let initial_pc = blob
+        .exports()
         .find(|export| export.symbol() == "main")
         .map_or(ProgramCounter(0), |x| x.program_counter());
 
