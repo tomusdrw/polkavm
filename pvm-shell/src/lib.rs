@@ -31,6 +31,14 @@ fn with_pvm<F, R>(f: F, default: R) -> R where F: FnMut(&mut RawInstance) -> R {
 }
 
 #[wasm_bindgen]
+pub fn resume(pc: u32, gas: i64) {
+    with_pvm(|pvm| {
+        pvm.set_gas(gas);
+        pvm.set_next_program_counter(ProgramCounter(pc));
+    }, ());
+}
+
+#[wasm_bindgen]
 pub fn reset(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
