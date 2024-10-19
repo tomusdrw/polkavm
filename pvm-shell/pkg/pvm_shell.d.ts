@@ -1,6 +1,11 @@
 /* tslint:disable */
 /* eslint-disable */
 /**
+* @param {number} pc
+* @param {bigint} gas
+*/
+export function resume(pc: number, gas: bigint): void;
+/**
 * @param {Uint8Array} program
 * @param {Uint8Array} registers
 * @param {bigint} gas

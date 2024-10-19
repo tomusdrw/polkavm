@@ -3,6 +3,13 @@ export function __wbg_set_wasm(val) {
     wasm = val;
 }
 
+/**
+* @param {number} pc
+* @param {bigint} gas
+*/
+export function resume(pc, gas) {
+    wasm.resume(pc, gas);
+}
 
 let cachedUint8ArrayMemory0 = null;
 
