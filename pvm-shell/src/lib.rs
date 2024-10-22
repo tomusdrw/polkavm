@@ -78,6 +78,7 @@ pub fn resetGeneric(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
     }
 
     *PVM.lock().unwrap() = Some(instance);
+    nextStep();
 }
 
 #[wasm_bindgen]
