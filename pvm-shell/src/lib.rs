@@ -9,14 +9,17 @@ use wasm_bindgen::prelude::wasm_bindgen;
 #[wasm_bindgen]
 #[derive(Copy, Clone, Debug)]
 pub enum Status {
-    Ok = 0,
-    Halt = 1,
-    Panic = 2,
-    OutOfGas = 3,
+    Ok = 255,
+    Halt = 0,
+    Panic = 1,
+    Fault = 2,
+    Host = 3,
+    OutOfGas = 4,
 }
 
 static PVM: Mutex<Option<RawInstance>> = Mutex::new(None);
 static STATUS: Mutex<Status> = Mutex::new(Status::Ok);
+static EXIT_ARG: Mutex<u32> = Mutex::new(0);
 
 const NO_OF_REGISTERS: usize = 13;
 const BYTES_PER_REG: usize = 4;
@@ -30,6 +33,7 @@ fn with_pvm<F, R>(f: F, default: R) -> R where F: FnMut(&mut RawInstance) -> R {
     }
 }
 
+#[deprecated = "Use setGasLeft / setNextProgramCounter instead."]
 #[wasm_bindgen]
 pub fn resume(pc: u32, gas: i64) {
     with_pvm(|pvm| {
@@ -38,8 +42,14 @@ pub fn resume(pc: u32, gas: i64) {
     }, ());
 }
 
+#[deprecated = "Use resetGeneric instead"]
 #[wasm_bindgen]
 pub fn reset(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
+    resetGeneric(program, registers, gas)
+}
+
+#[wasm_bindgen]
+pub fn resetGeneric(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
 
@@ -80,12 +90,13 @@ pub fn nextStep() -> bool {
             Ok(InterruptKind::Trap) => {
                 (false, Status::Panic)
             },
-            Ok(InterruptKind::Ecalli(_)) => {
-                // TODO [ToDr] handle ecalli
-                (true, Status::Ok)
+            Ok(InterruptKind::Ecalli(call)) => {
+                *EXIT_ARG.lock().unwrap() = call;
+                (true, Status::Host)
             },
-            Ok(InterruptKind::Segfault(_)) => {
-                (false, Status::Panic)
+            Ok(InterruptKind::Segfault(page)) => {
+                *EXIT_ARG.lock().unwrap() = page.page_address;
+                (false, Status::Fault)
             },
             Ok(InterruptKind::NotEnoughGas) => {
                 (false, Status::OutOfGas)
@@ -109,13 +120,29 @@ pub fn getProgramCounter() -> u32 {
 }
 
 #[wasm_bindgen]
-pub fn getStatus() -> Status {
-    *STATUS.lock().unwrap()
+pub fn setNextProgramCounter(pc: u32) {
+    with_pvm(|pvm| pvm.set_next_program_counter(ProgramCounter(pc)), ());
+}
+
+#[wasm_bindgen]
+pub fn getStatus() -> i8 {
+    let status = *STATUS.lock().unwrap();
+    if let Status::Ok = status { -1 } else { status as i8 }
+}
+
+#[wasm_bindgen]
+pub fn getExitArg() -> u32 {
+    *EXIT_ARG.lock().unwrap()
 }
 
 #[wasm_bindgen]
 pub fn getGasLeft() -> i64 {
     with_pvm(|pvm| pvm.gas(), 0)
+}
+
+#[wasm_bindgen]
+pub fn setGasLeft(gas: i64) {
+    with_pvm(|pvm| pvm.set_gas(gas), ());
 }
 
 #[wasm_bindgen]
