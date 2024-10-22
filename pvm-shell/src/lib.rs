@@ -169,19 +169,15 @@ pub fn getPageDump(index: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    const FIB: &[u8] = &[
+        0,0,33,4,8,1,4,9,1,5,3,0,2,119,255,7,7,12,82,138,8,152,8,82,169,5,243,82,135,4,8,4,9,17,19,0,73,147,82,213,0];
+
     #[test]
     fn run_simple_program() {
-        let program = vec![
-            0,
-            0,
-            3,
-            8,
-            135,
-            9,
-            249
-        ];
-        let registers = vec![0u8; 13 * 4];
-        reset(program, registers, 10_000);
+        let program = FIB.to_vec();
+        let mut registers = vec![0u8; 13 * 4];
+        registers[7] = 9;
+        resetGeneric(program, registers, 10_000);
         loop {
             let can_continue = nextStep();
             println!("Status: {:?}, PC: {}", getStatus(), getProgramCounter());
@@ -189,5 +185,16 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn should_change_pc_after_first_step() {
+        let program = FIB.to_vec();
+        let mut registers = vec![0u8; 13 * 4];
+        registers[7] = 9;
+        resetGeneric(program, registers, 10_000);
+        assert_eq!(getProgramCounter(), 0);
+        nextStep();
+        assert_eq!(getProgramCounter(), 3);
     }
 }
