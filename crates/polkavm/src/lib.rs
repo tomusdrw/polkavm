@@ -3,6 +3,8 @@
 #![forbid(clippy::missing_safety_doc)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::exhaustive_structs)]
+// TODO: Uncomment this once we get rid of all of the `as` casts:
+// #![deny(clippy::as_conversions)]
 
 #[cfg(all(
     not(miri),
@@ -129,8 +131,8 @@ pub mod debug_info {
 /// Miscellaneous types related to program blobs.
 pub mod program {
     pub use polkavm_common::program::{
-        Imports, ImportsIter, Instruction, Instructions, JumpTable, JumpTableIter, Opcode, ProgramExport, ProgramParseError, ProgramSymbol,
-        RawReg,
+        ISA32_V1_NoSbrk, Imports, ImportsIter, Instruction, InstructionSet, Instructions, JumpTable, JumpTableIter, Opcode,
+        ParsedInstruction, ProgramExport, ProgramParseError, ProgramSymbol, RawReg, ISA32_V1, ISA64_V1,
     };
 }
 
