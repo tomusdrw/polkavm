@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "spectool-wasm"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "serde_json",
  "spectool",
