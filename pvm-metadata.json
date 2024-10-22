@@ -1,6 +1,6 @@
 {
   "name": "polkavm",
-  "version": "0.11.0-c26d07",
+  "version": "0.13.0-463f37",
   "capabilities": {
     "resetJAM": false,
     "resetGeneric": true,
