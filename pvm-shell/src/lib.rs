@@ -50,14 +50,21 @@ pub fn reset(program: Vec<u8>, registers: Vec<u8>, gas: i64) {
     resetGeneric(
         program,
         registers,
-        vec![],
-        vec![],
         gas,
     )
 }
 
 #[wasm_bindgen]
 pub fn resetGeneric(
+    program: Vec<u8>,
+    registers: Vec<u8>,
+    gas: i64,
+) {
+    resetGenericWithMemory(program, registers, vec![], vec![], gas);
+}
+
+#[wasm_bindgen]
+pub fn resetGenericWithMemory(
     program: Vec<u8>,
     registers: Vec<u8>,
     page_map: Vec<u8>,
@@ -230,6 +237,12 @@ pub fn setup_memory(
         }
         false
     };
+
+    if let Some(ro_start) = ro_start {
+        if ro_start != 0x10000 {
+            panic!("Unsupported address of RO data.");
+        }
+    }
 
     for chunk in chunks {
         let is_in_ro = copy_chunk(&chunk, ro_start, parts.ro_data_size, &mut ro_data);
