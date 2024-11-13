@@ -3,6 +3,7 @@
 export const memory: WebAssembly.Memory;
 export function resume(a: number, b: number): void;
 export function reset(a: number, b: number, c: number, d: number, e: number): void;
+export function resetGenericWithMemory(a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number): void;
 export function nextStep(): number;
 export function getProgramCounter(): number;
 export function setNextProgramCounter(a: number): void;

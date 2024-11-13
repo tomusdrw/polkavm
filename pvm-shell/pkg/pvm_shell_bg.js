@@ -55,6 +55,25 @@ export function resetGeneric(program, registers, gas) {
 }
 
 /**
+* @param {Uint8Array} program
+* @param {Uint8Array} registers
+* @param {Uint8Array} page_map
+* @param {Uint8Array} chunks
+* @param {bigint} gas
+*/
+export function resetGenericWithMemory(program, registers, page_map, chunks, gas) {
+    const ptr0 = passArray8ToWasm0(program, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(registers, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray8ToWasm0(page_map, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray8ToWasm0(chunks, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    wasm.resetGenericWithMemory(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, gas);
+}
+
+/**
 * @returns {boolean}
 */
 export function nextStep() {

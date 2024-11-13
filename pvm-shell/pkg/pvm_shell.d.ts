@@ -18,6 +18,14 @@ export function reset(program: Uint8Array, registers: Uint8Array, gas: bigint): 
 */
 export function resetGeneric(program: Uint8Array, registers: Uint8Array, gas: bigint): void;
 /**
+* @param {Uint8Array} program
+* @param {Uint8Array} registers
+* @param {Uint8Array} page_map
+* @param {Uint8Array} chunks
+* @param {bigint} gas
+*/
+export function resetGenericWithMemory(program: Uint8Array, registers: Uint8Array, page_map: Uint8Array, chunks: Uint8Array, gas: bigint): void;
+/**
 * @returns {boolean}
 */
 export function nextStep(): boolean;
