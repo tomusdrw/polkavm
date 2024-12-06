@@ -30,6 +30,11 @@ export function resetGenericWithMemory(program: Uint8Array, registers: Uint8Arra
 */
 export function nextStep(): boolean;
 /**
+* @param {number} steps
+* @returns {boolean}
+*/
+export function run(steps: number): boolean;
+/**
 * @returns {number}
 */
 export function getProgramCounter(): number;
@@ -58,10 +63,19 @@ export function setGasLeft(gas: bigint): void;
 */
 export function getRegisters(): Uint8Array;
 /**
+* @param {Uint8Array} registers
+*/
+export function setRegisters(registers: Uint8Array): void;
+/**
 * @param {number} index
 * @returns {Uint8Array}
 */
 export function getPageDump(index: number): Uint8Array;
+/**
+* @param {number} address
+* @param {Uint8Array} data
+*/
+export function setMemory(address: number, data: Uint8Array): void;
 /**
 */
 export enum Status {
