@@ -136,6 +136,16 @@ pub fn nextStep() -> bool {
 }
 
 #[wasm_bindgen]
+pub fn run(steps: u32) -> bool {
+    for _ in 0..steps {
+        if !nextStep() {
+            return false;
+        }
+    }
+    return true;
+}
+
+#[wasm_bindgen]
 pub fn getProgramCounter() -> u32 {
     with_pvm(|pvm| pvm.program_counter().map(|x| x.0).unwrap_or(0), 0)
 }
@@ -181,6 +191,17 @@ pub fn getRegisters() -> Vec<u8> {
 }
 
 #[wasm_bindgen]
+pub fn setRegisters(registers: Vec<u8>) {
+    with_pvm(|pvm| {
+        for (i, reg) in (0..NO_OF_REGISTERS).zip(Reg::ALL) {
+            let start_bytes = i * BYTES_PER_REG;
+            let reg_value = read_u32(&registers, start_bytes);
+            pvm.set_reg(reg, reg_value);
+        }
+    }, ());
+}
+
+#[wasm_bindgen]
 pub fn getPageDump(index: u32) -> Vec<u8> {
     with_pvm(|pvm| {
         let address = index * PAGE_SIZE as u32;
@@ -189,6 +210,13 @@ pub fn getPageDump(index: u32) -> Vec<u8> {
             .unwrap_or_else(|_| vec![0; PAGE_SIZE]);
         page
     }, vec![0; PAGE_SIZE])
+}
+
+#[wasm_bindgen]
+pub fn setMemory(address: u32, data: Vec<u8>) {
+    with_pvm(|pvm| {
+        let _ = pvm.write_memory(address, &data);
+    }, ());
 }
 
 pub fn setup_memory(
