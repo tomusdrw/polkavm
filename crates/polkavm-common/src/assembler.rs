@@ -19,12 +19,12 @@ fn parse_reg_or_imm(text: &str) -> Option<RegImm> {
     }
 }
 
-fn parse_absolute_memory_access(text: &str) -> Option<i32> {
+fn parse_absolute_memory_access(text: &str) -> Option<i64> {
     let text = text.trim().strip_prefix('[')?.strip_suffix(']')?;
     parse_imm(text)
 }
 
-fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
+fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i64)> {
     let text = text.trim().strip_prefix('[')?.strip_suffix(']')?;
     if let Some(index) = text.find('+') {
         let reg = parse_reg(text[..index].trim())?;
@@ -37,7 +37,7 @@ fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
 
 /// Parses the long form of load_imm_and_jump_indirect:
 /// `tmp = {base}, {dst} = {value}, jump [tmp + {offset}]`, where `dest == base` is allowed
-fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i32, i32)> {
+fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i64, i64)> {
     let line = line.trim().strip_prefix("tmp")?;
     if !line.starts_with('=') && line.trim_start() == line {
         return None;
@@ -121,7 +121,7 @@ impl ConditionKind {
 #[derive(Copy, Clone)]
 enum RegImm {
     Reg(Reg),
-    Imm(i32),
+    Imm(i64),
 }
 
 #[derive(Copy, Clone)]
@@ -159,9 +159,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         Instruction(Instruction),
         Jump(String),
         Branch(String, ConditionKind, Reg, Reg),
-        BranchImm(String, ConditionKind, Reg, i32),
+        BranchImm(String, ConditionKind, Reg, i64),
         LoadLabelAddress(Reg, String),
-        LoadImmAndJump(Reg, i32, String),
+        LoadImmAndJump(Reg, i64, String),
     }
 
     impl MaybeInstruction {
@@ -763,7 +763,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         };
     }
 
-    let mut builder = crate::writer::ProgramBlobBuilder::new();
+    let mut builder = crate::writer::ProgramBlobBuilder::new_64bit();
     builder.set_ro_data(ro_data);
     builder.set_ro_data_size(ro_data_size);
     builder.set_rw_data(rw_data);

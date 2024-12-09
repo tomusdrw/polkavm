@@ -265,20 +265,20 @@ pub fn byte_slice_init<'dst>(dst: &'dst mut [MaybeUninit<u8>], src: &[u8]) -> &'
     unsafe { slice_assume_init_mut(dst) }
 }
 
-pub fn parse_imm(text: &str) -> Option<i32> {
+pub fn parse_imm(text: &str) -> Option<i64> {
     let text = text.trim();
     if let Some(text) = text.strip_prefix("0x") {
-        return u32::from_str_radix(text, 16).ok().map(|value| value as i32);
+        return u64::from_str_radix(text, 16).ok().map(|value| value as i64);
     }
 
     if let Some(text) = text.strip_prefix("0b") {
-        return u32::from_str_radix(text, 2).ok().map(|value| value as i32);
+        return u64::from_str_radix(text, 2).ok().map(|value| value as i64);
     }
 
-    if let Ok(value) = text.parse::<i32>() {
+    if let Ok(value) = text.parse::<i64>() {
         Some(value)
-    } else if let Ok(value) = text.parse::<u32>() {
-        Some(value as i32)
+    } else if let Ok(value) = text.parse::<u64>() {
+        Some(value as i64)
     } else {
         None
     }
