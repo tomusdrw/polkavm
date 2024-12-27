@@ -87,19 +87,22 @@ pub @expected_exit:
       : @1
      8: trap
       : @2
-     9: r7 = r7 - 1
-    12: jump @4 if r7 == 0
+     9: invalid
       : @3
+    12: jump @6 if r7 == 0
+      : @4
     15: r10 = r8
-    17: r8 = r8 + r9
+    17: invalid
+      : @5
     20: r9 = r10
     22: jump @2
-      : @4
+      : @6
     24: r7 = r8
     26: r8 = 0x0
     28: r9 = 0x0
     30: fallthrough
-      : @5
+      : @7
     31: ret
 "#;
+
 }
