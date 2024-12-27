@@ -22,7 +22,7 @@ static STATUS: Mutex<Status> = Mutex::new(Status::Ok);
 static EXIT_ARG: Mutex<u32> = Mutex::new(0);
 
 const NO_OF_REGISTERS: usize = 13;
-const BYTES_PER_REG: usize = 4;
+const BYTES_PER_REG: usize = 8;
 
 const PAGE_SIZE: usize = 4_096;
 
@@ -93,7 +93,7 @@ pub fn resetGenericWithMemory(
 
     for (i, reg) in (0..NO_OF_REGISTERS).zip(Reg::ALL) {
         let start_bytes = i * BYTES_PER_REG;
-        let reg_value = read_u32(&registers, start_bytes);
+        let reg_value = read_u64(&registers, start_bytes);
         instance.set_reg(reg, reg_value);
     }
 
@@ -195,7 +195,7 @@ pub fn setRegisters(registers: Vec<u8>) {
     with_pvm(|pvm| {
         for (i, reg) in (0..NO_OF_REGISTERS).zip(Reg::ALL) {
             let start_bytes = i * BYTES_PER_REG;
-            let reg_value = read_u32(&registers, start_bytes);
+            let reg_value = read_u64(&registers, start_bytes);
             pvm.set_reg(reg, reg_value);
         }
     }, ());
@@ -289,6 +289,12 @@ fn read_u32(source: &[u8], index: usize) -> u32 {
     let mut val = [0u8; 4];
     val.copy_from_slice(&source[index .. index + 4]);
     u32::from_le_bytes(val)
+}
+
+fn read_u64(source: &[u8], index: usize) -> u64 {
+    let mut val = [0u8; 8];
+    val.copy_from_slice(&source[index .. index + 8]);
+    u64::from_le_bytes(val)
 }
 
 /// Page Map is defined in JAM codec lingo as: `sequence(tuple(u32, u32, bool))`

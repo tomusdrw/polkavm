@@ -5,7 +5,7 @@
 
 use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, Reg};
 use polkavm_common::assembler::assemble;
-use polkavm_common::cast;
+use polkavm_common::cast::cast;
 use polkavm_common::program::ProgramParts;
 
 pub struct Testcase {
