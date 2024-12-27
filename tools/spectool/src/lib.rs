@@ -5,6 +5,7 @@
 
 use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, Reg};
 use polkavm_common::assembler::assemble;
+use polkavm_common::cast::cast;
 use polkavm_common::program::ProgramParts;
 
 pub struct Testcase {
@@ -31,14 +32,14 @@ pub struct MemoryChunk {
 #[serde(rename_all = "kebab-case")]
 pub struct TestcaseJson {
     pub name: String,
-    pub initial_regs: [u32; 13],
+    pub initial_regs: [u64; 13],
     pub initial_pc: u32,
     pub initial_page_map: Vec<Page>,
     pub initial_memory: Vec<MemoryChunk>,
     pub initial_gas: i64,
     pub program: Vec<u8>,
     pub expected_status: String,
-    pub expected_regs: Vec<u32>,
+    pub expected_regs: Vec<u64>,
     pub expected_pc: u32,
     pub expected_memory: Vec<MemoryChunk>,
     pub expected_gas: i64,
@@ -224,10 +225,33 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
 
     let expected_gas = instance.gas();
 
+    for ((final_value, reg), required_value) in expected_regs.iter().zip(Reg::ALL).zip(post.regs.iter()) {
+        if let Some(required_value) = required_value {
+            if final_value != required_value {
+                let msg = format!("{name:?}: unexpected {reg}: 0x{final_value:x} (expected: 0x{required_value:x})");
+                eprintln!("{}", msg);
+                if execute {
+                    return Err(msg);
+                }
+            }
+        }
+    }
+
+    if let Some(post_gas) = post.gas {
+        if expected_gas != post_gas {
+            let msg = format!("{name:?}: unexpected gas: {expected_gas} (expected: {post_gas})");
+            eprintln!("{}", msg);
+            if execute {
+                return Err(msg);
+            }
+        }
+    }
+
     let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
     disassembler.show_raw_bytes(true);
     disassembler.prefer_non_abi_reg_names(true);
     disassembler.prefer_unaliased(true);
+    disassembler.prefer_offset_jump_targets(true);
     disassembler.emit_header(false);
     disassembler.emit_exports(false);
 
@@ -257,7 +281,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
 #[derive(Default)]
 struct PrePost {
     gas: Option<i64>,
-    regs: [Option<u32>; 13],
+    regs: [Option<u64>; 13],
     pc: Option<(String, u32)>,
 }
 
@@ -291,8 +315,17 @@ fn parse_pre_post(line: &str, output: &mut PrePost) {
         output.pc = Some((label.to_owned(), offset));
     } else {
         let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' / 'post' directive: failed to parse lhs");
-        let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' / 'post' directive: failed to parse rhs");
-        output.regs[lhs as usize] = Some(rhs as u32);
+        let rhs = polkavm_common::utils::parse_imm(rhs)
+            .map(|i| {
+                if i < 0 {
+                    cast(cast(i).to_i64_sign_extend()).to_unsigned()
+                } else {
+                    cast(cast(i).to_unsigned()).to_u64()
+                }
+            })
+            .or_else(|| polkavm_common::utils::parse_imm64(rhs).map(|i| cast(i).to_unsigned()))
+            .expect("invalid 'pre' / 'post' directive: failed to parse rhs");
+        output.regs[lhs as usize] = Some(rhs);
     }
 }
 

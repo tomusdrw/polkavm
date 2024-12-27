@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use super::{get_native_page_size, OffsetTable, SandboxInit, SandboxKind, WorkerCache, WorkerCacheKind};
 use crate::api::{CompiledModuleKind, MemoryAccessError, Module};
-use crate::compiler::CompiledModule;
+use crate::compiler::{Bitness, CompiledModule, B32, B64};
 use crate::config::Config;
 use crate::config::GasMeteringKind;
 use crate::page_set::PageSet;
@@ -995,6 +995,8 @@ pub struct Sandbox {
     page_set: PageSet,
     dynamic_paging_enabled: bool,
     idle_regs: linux_raw::user_regs_struct,
+    aux_data_address: u32,
+    aux_data_length: u32,
 }
 
 impl Drop for Sandbox {
@@ -1598,6 +1600,8 @@ impl super::Sandbox for Sandbox {
             page_set: PageSet::new(),
             dynamic_paging_enabled: false,
             idle_regs,
+            aux_data_address: 0,
+            aux_data_length: 0,
         })
     }
 
@@ -1705,6 +1709,8 @@ impl super::Sandbox for Sandbox {
             reg.store(0, Ordering::Relaxed);
         }
 
+        self.aux_data_address = module.memory_map().aux_data_address();
+        self.aux_data_length = module.memory_map().aux_data_size();
         self.dynamic_paging_enabled = module.is_dynamic_paging();
         self.is_program_counter_valid = false;
         self.gas_metering = module.gas_metering();
@@ -1835,12 +1841,23 @@ impl super::Sandbox for Sandbox {
     }
 
     fn reg(&self, reg: Reg) -> RegValue {
-        self.vmctx().regs[reg as usize].load(Ordering::Relaxed)
+        let mut value = self.vmctx().regs[reg as usize].load(Ordering::Relaxed);
+        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+        if compiled_module.bitness == Bitness::B32 {
+            value &= 0xffffffff;
+        }
+
+        value
     }
 
-    fn set_reg(&mut self, reg: Reg, value: u32) {
+    fn set_reg(&mut self, reg: Reg, mut value: RegValue) {
         if let Some(ref mut pagefault) = self.pending_pagefault {
             pagefault.registers_modified = true;
+        }
+
+        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+        if compiled_module.bitness == Bitness::B32 {
+            value &= 0xffffffff;
         }
 
         self.vmctx().regs[reg as usize].store(value, Ordering::Relaxed)
@@ -1893,6 +1910,34 @@ impl super::Sandbox for Sandbox {
         }
     }
 
+    fn accessible_aux_size(&self) -> u32 {
+        assert!(!self.dynamic_paging_enabled);
+        self.aux_data_length
+    }
+
+    fn set_accessible_aux_size(&mut self, size: u32) -> Result<(), Error> {
+        assert!(!self.dynamic_paging_enabled);
+
+        let module = self.module.as_ref().unwrap();
+        self.aux_data_length = size;
+        self.vmctx().arg.store(self.aux_data_address, Ordering::Relaxed);
+        self.vmctx().arg2.store(size, Ordering::Relaxed);
+        self.vmctx().arg3.store(module.memory_map().aux_data_size(), Ordering::Relaxed);
+        self.vmctx()
+            .jump_into
+            .store(ZYGOTE_TABLES.1.ext_set_accessible_aux_size, Ordering::Relaxed);
+        self.wake_oneshot_and_expect_idle()
+    }
+
+    fn is_memory_accessible(&self, address: u32, size: u32, _is_writable: bool) -> bool {
+        assert!(self.dynamic_paging_enabled);
+
+        let module = self.module.as_ref().unwrap();
+        let page_start = module.address_to_page(module.round_to_page_size_down(address));
+        let page_end = module.address_to_page(module.round_to_page_size_down(address + size));
+        self.page_set.contains((page_start, page_end))
+    }
+
     fn reset_memory(&mut self) -> Result<(), Error> {
         if self.module.is_none() {
             return Err(Error::from_str("no module loaded into the sandbox"));
@@ -1926,9 +1971,7 @@ impl super::Sandbox for Sandbox {
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + slice.len() as u32));
             if !self.page_set.contains((page_start, page_end)) {
-                unsafe {
-                    core::ptr::write_bytes(slice.as_mut_ptr().cast::<u8>(), 0, slice.len());
-                }
+                return Err(MemoryAccessError::Error("incomplete read".into()));
             } else {
                 let memory: &[core::mem::MaybeUninit<u8>] =
                     unsafe { core::slice::from_raw_parts(self.memory_mmap.as_ptr().cast(), self.memory_mmap.len()) };
@@ -2201,13 +2244,22 @@ impl Sandbox {
                 core::sync::atomic::fence(Ordering::Acquire);
 
                 let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+                if compiled_module.bitness == Bitness::B32 {
+                    for reg_value in &self.vmctx().regs {
+                        reg_value.fetch_and(0xffffffff, Ordering::Relaxed);
+                    }
+                }
+
                 let address = self.vmctx().next_native_program_counter.load(Ordering::Relaxed);
                 let gas = self.vmctx().gas.load(Ordering::Relaxed);
                 if gas < 0 {
                     // Read the gas cost from the machine code.
-                    let Some(offset) = address
-                        .checked_sub(compiled_module.native_code_origin + crate::compiler::ArchVisitor::<Self>::GAS_METERING_TRAP_OFFSET)
-                    else {
+                    let gas_metering_trap_offset = match compiled_module.bitness {
+                        Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::GAS_METERING_TRAP_OFFSET,
+                        Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::GAS_METERING_TRAP_OFFSET,
+                    };
+
+                    let Some(offset) = address.checked_sub(compiled_module.native_code_origin + gas_metering_trap_offset) else {
                         return Err(Error::from_str("internal error: address underflow after a trap"));
                     };
 
@@ -2219,7 +2271,12 @@ impl Sandbox {
                         return Err(Error::from_str("internal error: failed to find the program counter based on the native program counter when running out of gas"));
                     };
 
-                    let offset = offset as usize + crate::compiler::ArchVisitor::<Self>::GAS_COST_OFFSET;
+                    let gas_cost_offset = match compiled_module.bitness {
+                        Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::GAS_COST_OFFSET,
+                        Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::GAS_COST_OFFSET,
+                    };
+
+                    let offset = offset as usize + gas_cost_offset;
                     let Some(gas_cost) = &compiled_module.machine_code().get(offset..offset + 4) else {
                         return Err(Error::from_str(
                             "internal error: failed to read back the gas cost from the machine code",
@@ -2440,7 +2497,7 @@ impl Sandbox {
             use polkavm_common::regmap::NativeReg::*;
 
             #[deny(unreachable_patterns)]
-            let value = match polkavm_common::regmap::to_native_reg(reg) {
+            let mut value = match polkavm_common::regmap::to_native_reg(reg) {
                 rax => regs.rax,
                 rcx => regs.rcx,
                 rdx => regs.rdx,
@@ -2458,7 +2515,11 @@ impl Sandbox {
                 r15 => regs.r15,
             };
 
-            self.vmctx().regs[reg as usize].store(value as u32, Ordering::Relaxed);
+            if compiled_module.bitness == Bitness::B32 {
+                value &= 0xffffffff;
+            }
+
+            self.vmctx().regs[reg as usize].store(value, Ordering::Relaxed);
         }
 
         Ok(())
@@ -2488,7 +2549,7 @@ impl Sandbox {
                 r15 => &mut regs.r15,
             };
 
-            *value = u64::from(self.vmctx().regs[reg as usize].load(Ordering::Relaxed));
+            *value = self.vmctx().regs[reg as usize].load(Ordering::Relaxed);
         }
 
         linux_raw::sys_ptrace_setregs(self.child.pid, &regs)?;
