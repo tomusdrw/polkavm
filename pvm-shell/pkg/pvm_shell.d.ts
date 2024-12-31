@@ -33,7 +33,7 @@ export function nextStep(): boolean;
 * @param {number} steps
 * @returns {boolean}
 */
-export function run(steps: number): boolean;
+export function nSteps(steps: number): boolean;
 /**
 * @returns {number}
 */
