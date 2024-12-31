@@ -104,5 +104,4 @@ pub @expected_exit:
       : @7
     31: ret
 "#;
-
 }
