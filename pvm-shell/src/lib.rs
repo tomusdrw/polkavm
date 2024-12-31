@@ -136,7 +136,7 @@ pub fn nextStep() -> bool {
 }
 
 #[wasm_bindgen]
-pub fn run(steps: u32) -> bool {
+pub fn nSteps(steps: u32) -> bool {
     for _ in 0..steps {
         if !nextStep() {
             return false;
