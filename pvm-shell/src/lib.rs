@@ -81,6 +81,7 @@ pub fn resetGenericWithMemory(
     module_config.set_step_tracing(true);
 
     let mut parts = ProgramParts::default();
+    parts.is_64_bit = true;
     parts.code_and_jump_table = program.into();
     setup_memory(&mut parts, page_map, chunks);
     let blob = ProgramBlob::from_parts(parts).unwrap();
@@ -253,7 +254,7 @@ pub fn setup_memory(
 
     let copy_chunk = |chunk: &Chunk, start, size, into: &mut Vec<u8>| {
         if let Some(start) = start {
-            if chunk.address > start {
+            if chunk.address >= start {
                 let rel_address = chunk.address - start;
                 if rel_address < size {
                     let rel_address = rel_address as usize;
