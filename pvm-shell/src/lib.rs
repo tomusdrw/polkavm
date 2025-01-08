@@ -114,7 +114,7 @@ pub fn nextStep() -> bool {
             },
             Ok(InterruptKind::Ecalli(call)) => {
                 *EXIT_ARG.lock().unwrap() = call;
-                (true, Status::Host)
+                (false, Status::Host)
             },
             Ok(InterruptKind::Segfault(page)) => {
                 *EXIT_ARG.lock().unwrap() = page.page_address;

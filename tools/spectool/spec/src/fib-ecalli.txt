@@ -1,0 +1,36 @@
+pre: r0 = 4294901760
+pre: r7 = 9
+
+pub @expected_exit:
+pub @main:
+	u8 [0x20000] = 48
+	r7 = 0x0
+	r8 = 0x20000
+	r9 = 0x1
+	r10 = 0x21000
+	r11 = 0x4
+	ecalli 2
+	r12 = u32 [0x21000]
+	r8 = 0x1
+	r9 = 0x1
+	jump @block2
+@block1:
+	trap
+@block2:
+	r12 = r12 - 1
+	jump @block4 if r12 == 0
+@block3:
+	r10 = r8
+	r8 = r8 + r9
+	r9 = r10
+	jump @block2
+@block4:
+	u32 [0x21000] = r8
+	u8 [0x20000] = 48
+	r7 = 0x20000
+	r8 = 0x1
+	r9 = 0x21000
+	r10 = 0x4
+	ecalli 3
+	fallthrough
+	ret
