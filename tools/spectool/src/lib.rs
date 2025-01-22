@@ -48,13 +48,16 @@ pub fn new_engine() -> Engine {
 pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
     let mut parts = ProgramParts::default();
     parts.code_and_jump_table = bytecode.into();
+    parts.is_64_bit = true;
     let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
 
     let mut disassembler =
         polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+
     disassembler.show_raw_bytes(false);
     disassembler.prefer_non_abi_reg_names(true);
-    disassembler.prefer_unaliased(false);
+    disassembler.prefer_unaliased(true);
+    disassembler.prefer_offset_jump_targets(true);
     disassembler.emit_header(false);
     disassembler.emit_exports(false);
 
