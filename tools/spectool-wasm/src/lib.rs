@@ -52,7 +52,7 @@ pub @expected_exit:
     fn should_compile_assembly() {
         let result = compile_assembly(&ASSEMBLY);
 
-        assert!(result.is_ok());
+        assert_eq!(result.map(|_| ()), Ok(()));
     }
 
     #[test]
@@ -66,8 +66,43 @@ pub @expected_exit:
 @block2:
 	r7 = 0xdeadbeef
 "#,
-        );
-        assert!(result.is_ok());
+        )
+        .map(|_| ());
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn should_compile_yet_another_assembly() {
+        let result = compile_assembly(
+            r#"
+pre: r0 = 4294901760
+pre: r7 = 9
+
+pub @main:
+	r8 = 0x1
+	r9 = 0x1
+	jump @block2
+@block1:
+	trap
+@block2:
+	r7 = r7 + 1
+	jump @block4 if r7 == 0
+@block3:
+	r10 = r8
+	r8 = r8 + r9
+	r9 = r10
+	jump @block2
+@block4:
+	r7 = r8
+	r8 = 0x0
+	r9 = 0x0
+	fallthrough
+@block5:
+	jump [r0 + 0]
+"#,
+        )
+        .map(|_| ());
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

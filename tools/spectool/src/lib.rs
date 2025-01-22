@@ -1,4 +1,6 @@
-use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramParts, Reg};
+#![allow(clippy::print_stderr)]
+
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, ProgramParts, Reg};
 use polkavm_common::assembler::assemble;
 
 pub struct Testcase {
@@ -110,7 +112,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
     module_config.set_step_tracing(true);
 
-    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+    let module = Module::from_blob(engine, &module_config, blob.clone()).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
@@ -199,7 +201,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     };
 
     if expected_status != "halt" {
-        final_pc = instance.program_counter().unwrap();
+        final_pc = instance.program_counter().unwrap_or(ProgramCounter(0));
     }
 
     if execute && final_pc.0 != expected_final_pc {
