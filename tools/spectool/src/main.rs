@@ -6,16 +6,12 @@
 use clap::Parser;
 use core::fmt::Write;
 use polkavm::{Engine, Reg};
-use spectool::{prepare_input, Testcase};
+use spectool::prepare_input;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
 enum Args {
-    Prepare {
-        /// The input file.
-        input: PathBuf,
-    },
     Generate,
     Test,
 }
@@ -25,7 +21,6 @@ fn main() {
 
     let args = Args::parse();
     match args {
-        Args::Prepare { input } => main_prepare(input),
         Args::Generate => main_generate(),
         Args::Test => main_test(),
     }
@@ -40,13 +35,25 @@ fn main_generate() {
     let engine = Engine::new(&config).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
     let mut found_errors = false;
-    for entry in std::fs::read_dir(root.join("src")).unwrap() {
-        let path = entry.unwrap().path();
-        let test_case = prepare_file(&engine, &path);
-        if let Ok(test_case) = test_case {
-            tests.push(test_case);
-        } else {
-            found_errors = true;
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(root.join("src"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+
+    paths.sort_by_key(|entry| entry.file_stem().unwrap().to_string_lossy().to_string());
+
+    for path in paths {
+        let name = path.file_stem().unwrap().to_string_lossy();
+        let input = std::fs::read_to_string(&path).unwrap();
+
+        let test_case = prepare_input(&input, &engine, &name, true);
+        match test_case {
+            Ok(case) => tests.push(case),
+            Err(e) => {
+                eprintln!("{e}");
+                found_errors = true;
+            }
         }
     }
 
@@ -191,25 +198,6 @@ fn main_generate() {
     }
 }
 
-fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, String> {
-    let name = path.file_stem().unwrap().to_string_lossy();
-    let input = std::fs::read_to_string(path).unwrap();
-    let input = input.lines().collect::<Vec<_>>().join("\n");
-    prepare_input(&input, engine, &name, true)
-}
-
 fn main_test() {
     todo!();
-}
-
-fn main_prepare(input: PathBuf) {
-    let mut config = polkavm::Config::new();
-    config.set_backend(Some(polkavm::BackendKind::Interpreter));
-    let engine = Engine::new(&config).unwrap();
-
-    let test = prepare_file(&engine, &input);
-    if let Ok(test) = test {
-        let payload = serde_json::to_string_pretty(&test.json).unwrap();
-        println!("{payload}");
-    }
 }

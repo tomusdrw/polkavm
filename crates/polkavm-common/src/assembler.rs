@@ -1,6 +1,5 @@
-use crate::cast::cast;
 use crate::program::{Instruction, Reg};
-use crate::utils::{parse_imm, parse_imm64, parse_reg};
+use crate::utils::{parse_imm, parse_immediate, parse_reg, ParsedImmediate};
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -171,7 +170,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         Branch(String, ConditionKind, Reg, Reg),
         BranchImm(String, ConditionKind, Reg, i32),
         LoadLabelAddress(Reg, String),
-        LoadImmAndJump(Reg, i32, String),
+        LoadImmAndJump(Reg, u32, String),
     }
 
     impl MaybeInstruction {
@@ -392,14 +391,13 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
 
             if let Some(dst) = parse_reg(lhs) {
                 if let Some(index) = rhs.find(',') {
-                    if let Some(value) = parse_imm(&rhs[..index]) {
+                    if let Some(value) = parse_immediate(&rhs[..index]).and_then(|value| value.try_into().ok()) {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
-                                let instruction =
-                                    Instruction::load_imm_and_jump_indirect(dst.into(), base.into(), value as u32, offset as u32);
+                                let instruction = Instruction::load_imm_and_jump_indirect(dst.into(), base.into(), value, offset as u32);
 
                                 if dst == base {
                                     return Err(format!("cannot parse line {nth_line}, expected: \"{instruction}\""));
@@ -443,23 +441,15 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     emit_and_continue!(Instruction::move_reg(dst.into(), src.into()));
                 }
 
-                if let Some(index) = rhs.find("i64 ") {
-                    let rhs = rhs[index + 4..].trim();
-                    if let Some(imm) = parse_imm(rhs) {
-                        let imm = cast(imm).to_i64_sign_extend();
-                        emit_and_continue!(Instruction::load_imm64(dst.into(), imm as u64));
+                if let Some(instr) = parse_immediate(rhs) {
+                    match instr {
+                        ParsedImmediate::U32(value) => {
+                            emit_and_continue!(Instruction::load_imm(dst.into(), value));
+                        }
+                        ParsedImmediate::U64(value) => {
+                            emit_and_continue!(Instruction::load_imm64(dst.into(), value));
+                        }
                     }
-                    if let Some(imm64) = parse_imm64(rhs) {
-                        emit_and_continue!(Instruction::load_imm64(dst.into(), imm64 as u64));
-                    }
-                }
-
-                if let Some(imm) = parse_imm(rhs) {
-                    emit_and_continue!(Instruction::load_imm(dst.into(), imm as u32));
-                }
-
-                if let Some(imm64) = parse_imm64(rhs) {
-                    emit_and_continue!(Instruction::load_imm64(dst.into(), imm64 as u64));
                 }
 
                 if let Some(label) = rhs.strip_prefix('@') {
@@ -593,10 +583,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                     });
                                 }
                             }
-                        } else if let Some(src2) = parse_imm(src2) {
+                        } else if let Some(src2) = parse_immediate(src2).and_then(|value| value.try_into().ok()) {
                             let dst = dst.into();
                             let src1 = src1.into();
-                            let src2 = src2 as u32;
                             match op_marker {
                                 OpMarker::I32 => {
                                     emit_and_continue!(match op {
@@ -664,10 +653,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                 }
                             }
                         }
-                    } else if let Some(src1) = parse_imm(src1) {
+                    } else if let Some(src1) = parse_immediate(src1).and_then(|value| value.try_into().ok()) {
                         if let Some(src2) = parse_reg(src2) {
                             let dst = dst.into();
-                            let src1 = src1 as u32;
                             let src2 = src2.into();
                             match op_marker {
                                 OpMarker::I32 => {
@@ -812,8 +800,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                             StoreKind::U32 => Instruction::store_u32(rhs, offset),
                             StoreKind::U64 => Instruction::store_u64(rhs, offset),
                         });
-                    } else if let Some(rhs) = parse_imm(rhs) {
-                        let rhs = rhs as u32;
+                    } else if let Some(rhs) = parse_immediate(rhs).and_then(|value| value.try_into().ok()) {
                         emit_and_continue!(match kind {
                             StoreKind::U8 => match u8::try_from(rhs) {
                                 Ok(_) => Instruction::store_imm_u8(offset, rhs),
@@ -838,8 +825,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                             StoreKind::U32 => Instruction::store_indirect_u32(rhs, base, offset),
                             StoreKind::U64 => Instruction::store_indirect_u64(rhs, base, offset),
                         });
-                    } else if let Some(rhs) = parse_imm(rhs) {
-                        let rhs = rhs as u32;
+                    } else if let Some(rhs) = parse_immediate(rhs).and_then(|value| value.try_into().ok()) {
                         emit_and_continue!(match kind {
                             StoreKind::U8 => match u8::try_from(rhs) {
                                 Ok(_) => Instruction::store_imm_indirect_u8(base, offset, rhs),
@@ -883,7 +869,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     return Err(format!("label is not defined: \"{label}\""));
                 };
 
-                code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index));
+                code.push(Instruction::load_imm_and_jump(dst.into(), value, target_index));
             }
             MaybeInstruction::Jump(label) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {

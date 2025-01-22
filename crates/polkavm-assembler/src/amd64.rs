@@ -1013,6 +1013,13 @@ pub mod addr {
         }
     }
 
+    impl From<(RegSize, MemOp, RegIndex)> for Operands {
+        #[inline]
+        fn from((reg_size, dst, src): (RegSize, MemOp, RegIndex)) -> Self {
+            Self::RegMem_Reg(reg_size.into(), RegMem::Mem(dst), src.into())
+        }
+    }
+
     impl From<(RegSize, Reg, MemOp)> for Operands {
         #[inline]
         fn from((reg_size, dst, src): (RegSize, Reg, MemOp)) -> Self {
@@ -1419,6 +1426,12 @@ pub mod inst {
             None,
             (fmt.write_fmt(core::format_args!("cmov{} {}, {}", self.0.suffix(), self.2.name_from(self.1), self.3.display_without_prefix(Size::from(self.1))))),
 
+        // https://www.felixcloutier.com/x86/xchg
+        xchg_mem(RegSize, Reg, MemOp) =>
+            Inst::new(0x87).rex_64b_if(matches!(self.0, RegSize::R64)).modrm_reg(self.1).mem(self.2).encode(),
+            None,
+            (fmt.write_fmt(core::format_args!("xchg {}, {}", self.1.name_from(self.0), self.2))),
+
         // https://www.felixcloutier.com/x86/add
         add(Operands) =>
             alu_impl(0x00, 0x02, 0b000, self.0),
@@ -1661,6 +1674,11 @@ pub mod inst {
 
         // https://www.felixcloutier.com/x86/mul
         mul(RegSize, RegMem) =>
+            Inst::new(0xf7).modrm_opext(0b100).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).encode(),
+            None,
+            (fmt.write_fmt(core::format_args!("mul {}", self.1.display(Size::from(self.0))))),
+
+        mul_dx_ax(RegSize, RegMem) =>
             Inst::new(0xf7).modrm_opext(0b100).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).encode(),
             None,
             (fmt.write_fmt(core::format_args!("mul {}", self.1.display(Size::from(self.0))))),
@@ -2347,6 +2365,7 @@ mod tests {
         movzx_16_to_64,
         movsxd_32_to_64,
         mul,
+        mul_dx_ax,
         neg,
         nop,
         nop10,
@@ -2384,6 +2403,7 @@ mod tests {
         syscall,
         test,
         ud2,
+        xchg_mem,
         xor,
     }
 
