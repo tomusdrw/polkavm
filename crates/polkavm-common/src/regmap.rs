@@ -8,8 +8,8 @@ pub const fn to_native_reg(reg: Reg) -> NativeReg {
     // We try to assign registers which result in more compact code to the more common RISC-V registers.
     match reg {
         Reg::A0 => rdi,
-        Reg::A1 => rsi,
-        Reg::SP => rax,
+        Reg::A1 => rax,
+        Reg::SP => rsi,
         Reg::RA => rbx,
         Reg::A2 => rdx,
         Reg::A3 => rbp,
@@ -22,6 +22,12 @@ pub const fn to_native_reg(reg: Reg) -> NativeReg {
         Reg::T2 => r12,
     }
 }
+
+/// A temporary register which can be freely used.
+pub const TMP_REG: NativeReg = rcx;
+
+/// A temporary register which must be saved/restored.
+pub const AUX_TMP_REG: NativeReg = r15;
 
 #[inline]
 pub const fn to_guest_reg(reg: NativeReg) -> Option<Reg> {

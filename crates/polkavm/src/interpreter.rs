@@ -667,6 +667,7 @@ impl InterpretedInstance {
 
             self.program_counter = program_counter;
             self.compiled_offset = self.resolve_arbitrary_jump::<DEBUG>(program_counter).unwrap_or(TARGET_OUT_OF_RANGE);
+            self.next_program_counter_changed = false;
 
             if DEBUG {
                 log::debug!("Starting execution at: {} [{}]", program_counter, self.compiled_offset);
@@ -1906,6 +1907,49 @@ define_interpreter! {
         visitor.go_to_next_instruction()
     }
 
+    fn memset<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: memset", visitor.inner.compiled_offset);
+        }
+
+        let gas_metering_enabled = visitor.inner.module.gas_metering().is_some();
+
+        // TODO: This is very inefficient.
+        let next_instruction = visitor.go_to_next_instruction();
+        let mut result = next_instruction;
+
+        let value = visitor.get32(Reg::A1);
+        let mut dst = visitor.get32(Reg::A0);
+        let mut count = visitor.get64(Reg::A2);
+        while count > 0 {
+            if gas_metering_enabled && visitor.inner.gas == 0 {
+                result = not_enough_gas_impl::<DEBUG>(visitor, program_counter, 0);
+                break;
+            }
+
+            if visitor.inner.module.is_dynamic_paging() {
+                result = visitor.store::<u8, DEBUG, true>(program_counter, value, None, dst);
+            } else {
+                result = visitor.store::<u8, DEBUG, false>(program_counter, value, None, dst);
+            }
+            if result != next_instruction {
+                break;
+            }
+
+            if gas_metering_enabled {
+                visitor.inner.gas -= 1;
+            }
+
+            dst += 1;
+            count -= 1;
+        }
+
+        visitor.set64::<DEBUG>(Reg::A0, u64::from(dst));
+        visitor.set64::<DEBUG>(Reg::A2, count);
+
+        result
+    }
+
     fn ecalli<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, hostcall_number: u32) -> Option<Target> {
         if DEBUG {
             log::trace!("[{}]: ecalli {hostcall_number}", visitor.inner.compiled_offset);
@@ -2638,42 +2682,6 @@ define_interpreter! {
 
         let hword = cast(visitor.get64(s)).truncate_to_u16();
         visitor.set64::<DEBUG>(d, cast(hword).to_u64());
-        visitor.go_to_next_instruction()
-    }
-
-    fn or_combine_byte_32<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s: Reg) -> Option<Target> {
-        if DEBUG {
-            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::or_combine_byte(d, s));
-        }
-
-        let word = visitor.get32(s);
-
-        let mut result = 0;
-        for i in (0..32).step_by(8) {
-            if (word & (0xffu32 << i)) != 0 {
-                result |= 0xffu32 << i;
-            }
-        }
-
-        visitor.set32::<DEBUG>(d, result);
-        visitor.go_to_next_instruction()
-    }
-
-    fn or_combine_byte_64<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s: Reg) -> Option<Target> {
-        if DEBUG {
-            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::or_combine_byte(d, s));
-        }
-
-        let word = visitor.get64(s);
-
-        let mut result = 0;
-        for i in (0..64).step_by(8) {
-            if (word & (0xffu64 << i)) != 0 {
-                result |= 0xffu64 << i;
-            }
-        }
-
-        visitor.set64::<DEBUG>(d, result);
         visitor.go_to_next_instruction()
     }
 
@@ -3592,6 +3600,10 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
         emit!(self, sbrk(dst, size));
     }
 
+    fn memset(&mut self) -> Self::ReturnTy {
+        emit!(self, memset(self.program_counter));
+    }
+
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         emit!(self, ecalli(self.program_counter, imm));
     }
@@ -3959,14 +3971,6 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
             emit!(self, zero_extend_16_64(d, s));
         } else {
             emit!(self, zero_extend_16_32(d, s));
-        }
-    }
-
-    fn or_combine_byte(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        if self.module.blob().is_64_bit() {
-            emit!(self, or_combine_byte_64(d, s));
-        } else {
-            emit!(self, or_combine_byte_32(d, s));
         }
     }
 
