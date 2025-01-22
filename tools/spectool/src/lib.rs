@@ -1,12 +1,5 @@
-#![allow(clippy::exit)]
-#![allow(clippy::print_stdout)]
-#![allow(clippy::print_stderr)]
-#![allow(clippy::use_debug)]
-
-use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, Reg};
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramParts, Reg};
 use polkavm_common::assembler::assemble;
-use polkavm_common::cast::cast;
-use polkavm_common::program::ProgramParts;
 
 pub struct Testcase {
     pub disassembly: String,
@@ -45,27 +38,31 @@ pub struct TestcaseJson {
     pub expected_gas: i64,
 }
 
-fn extract_chunks(base_address: u32, slice: &[u8]) -> Vec<MemoryChunk> {
-    let mut output = Vec::new();
-    let mut position = 0;
-    while let Some(next_position) = slice[position..].iter().position(|&byte| byte != 0).map(|offset| position + offset) {
-        position = next_position;
-        let length = slice[position..].iter().take_while(|&&byte| byte != 0).count();
-        output.push(MemoryChunk {
-            address: base_address + position as u32,
-            contents: slice[position..position + length].into(),
-        });
-        position += length;
-    }
-
-    output
-}
-
 pub fn new_engine() -> Engine {
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
 
     Engine::new(&config).unwrap()
+}
+
+pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
+    let mut parts = ProgramParts::default();
+    parts.code_and_jump_table = bytecode.into();
+    let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
+
+    let mut disassembler =
+        polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+    disassembler.show_raw_bytes(false);
+    disassembler.prefer_non_abi_reg_names(true);
+    disassembler.prefer_unaliased(false);
+    disassembler.emit_header(false);
+    disassembler.emit_exports(false);
+
+    let mut disassembly = Vec::new();
+    disassembler.disassemble_into(&mut disassembly).map_err(to_string)?;
+    let disassembly = String::from_utf8(disassembly).map_err(to_string)?;
+
+    Ok(disassembly)
 }
 
 pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) -> Result<Testcase, String> {
@@ -110,7 +107,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
     module_config.set_step_tracing(true);
 
-    let module = Module::from_blob(engine, &module_config, blob.clone()).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
@@ -144,10 +141,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
         });
     }
 
-    let initial_pc = blob
-        .exports()
-        .find(|export| export.symbol() == "main")
-        .map_or(ProgramCounter(0), |x| x.program_counter());
+    let initial_pc = blob.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
 
     let expected_final_pc = if let Some(export) = blob.exports().find(|export| export.symbol() == "expected_exit") {
         assert!(
@@ -183,29 +177,25 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     }
 
     let mut final_pc = initial_pc;
-    let expected_status = if execute {
-        loop {
-            match instance.run().unwrap() {
-                InterruptKind::Finished => break "halt",
-                InterruptKind::Trap => break "trap",
-                InterruptKind::Ecalli(..) => todo!(),
-                InterruptKind::NotEnoughGas => break "out-of-gas",
-                InterruptKind::Segfault(..) => todo!(),
-                InterruptKind::Step => {
-                    final_pc = instance.program_counter().unwrap();
-                    continue;
-                }
+    let expected_status = loop {
+        match instance.run().unwrap() {
+            InterruptKind::Finished => break "halt",
+            InterruptKind::Trap => break "trap",
+            InterruptKind::Ecalli(..) => todo!(),
+            InterruptKind::NotEnoughGas => break "out-of-gas",
+            InterruptKind::Segfault(..) => todo!(),
+            InterruptKind::Step => {
+                final_pc = instance.program_counter().unwrap();
+                continue;
             }
         }
-    } else {
-        "halt"
     };
 
     if expected_status != "halt" {
         final_pc = instance.program_counter().unwrap();
     }
 
-    if execute && final_pc.0 != expected_final_pc {
+    if final_pc.0 != expected_final_pc {
         let msg = format!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
         eprintln!("{}", msg);
         return Err(msg);
@@ -278,6 +268,26 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     })
 }
 
+fn to_string<E: core::fmt::Debug>(e: E) -> String {
+    format!("{:?}", e)
+}
+
+fn extract_chunks(base_address: u32, slice: &[u8]) -> Vec<MemoryChunk> {
+    let mut output = Vec::new();
+    let mut position = 0;
+    while let Some(next_position) = slice[position..].iter().position(|&byte| byte != 0).map(|offset| position + offset) {
+        position = next_position;
+        let length = slice[position..].iter().take_while(|&&byte| byte != 0).count();
+        output.push(MemoryChunk {
+            address: base_address + position as u32,
+            contents: slice[position..position + length].into(),
+        });
+        position += length;
+    }
+
+    output
+}
+
 #[derive(Default)]
 struct PrePost {
     gas: Option<i64>,
@@ -315,40 +325,9 @@ fn parse_pre_post(line: &str, output: &mut PrePost) {
         output.pc = Some((label.to_owned(), offset));
     } else {
         let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' / 'post' directive: failed to parse lhs");
-        let rhs = polkavm_common::utils::parse_imm(rhs)
-            .map(|i| {
-                if i < 0 {
-                    cast(cast(i).to_i64_sign_extend()).to_unsigned()
-                } else {
-                    cast(cast(i).to_unsigned()).to_u64()
-                }
-            })
-            .or_else(|| polkavm_common::utils::parse_imm64(rhs).map(|i| cast(i).to_unsigned()))
+        let rhs = polkavm_common::utils::parse_immediate(rhs)
+            .map(Into::into)
             .expect("invalid 'pre' / 'post' directive: failed to parse rhs");
         output.regs[lhs as usize] = Some(rhs);
     }
-}
-
-fn to_string<E: core::fmt::Debug>(e: E) -> String {
-    format!("{:?}", e)
-}
-
-pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
-    let mut parts = ProgramParts::default();
-    parts.code_and_jump_table = bytecode.into();
-    let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
-
-    let mut disassembler =
-        polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
-    disassembler.show_raw_bytes(false);
-    disassembler.prefer_non_abi_reg_names(true);
-    disassembler.prefer_unaliased(false);
-    disassembler.emit_header(false);
-    disassembler.emit_exports(false);
-
-    let mut disassembly = Vec::new();
-    disassembler.disassemble_into(&mut disassembly).map_err(to_string)?;
-    let disassembly = String::from_utf8(disassembly).map_err(to_string)?;
-
-    Ok(disassembly)
 }
