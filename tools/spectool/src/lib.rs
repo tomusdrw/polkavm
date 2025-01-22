@@ -180,25 +180,29 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     }
 
     let mut final_pc = initial_pc;
-    let expected_status = loop {
-        match instance.run().unwrap() {
-            InterruptKind::Finished => break "halt",
-            InterruptKind::Trap => break "trap",
-            InterruptKind::Ecalli(..) => todo!(),
-            InterruptKind::NotEnoughGas => break "out-of-gas",
-            InterruptKind::Segfault(..) => todo!(),
-            InterruptKind::Step => {
-                final_pc = instance.program_counter().unwrap();
-                continue;
+    let expected_status = if execute {
+        loop {
+            match instance.run().unwrap() {
+                InterruptKind::Finished => break "halt",
+                InterruptKind::Trap => break "trap",
+                InterruptKind::Ecalli(..) => todo!(),
+                InterruptKind::NotEnoughGas => break "out-of-gas",
+                InterruptKind::Segfault(..) => todo!(),
+                InterruptKind::Step => {
+                    final_pc = instance.program_counter().unwrap();
+                    continue;
+                }
             }
         }
+    } else {
+        "ok"
     };
 
     if expected_status != "halt" {
         final_pc = instance.program_counter().unwrap();
     }
 
-    if final_pc.0 != expected_final_pc {
+    if execute && final_pc.0 != expected_final_pc {
         let msg = format!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
         eprintln!("{}", msg);
         return Err(msg);
