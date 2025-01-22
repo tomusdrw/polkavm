@@ -58,10 +58,10 @@ pub @expected_exit:
     #[test]
     fn should_compile_other_assembly() {
         let result = compile_assembly(
-            r#"@block0:
+            r#"pub @main:
 	r7 = 0x4d2
 	jump @block2 if r7 == 1235
-@block1:
+pub @expected_exit:
 	trap
 @block2:
 	r7 = 0xdeadbeef
@@ -87,21 +87,19 @@ pub @expected_exit:
       : @1
      8: trap
       : @2
-     9: invalid
+     9: r7 = r7 + 0xffffffff
+    12: jump @4 if r7 == 0
       : @3
-    12: jump @6 if r7 == 0
-      : @4
     15: r10 = r8
-    17: invalid
-      : @5
+    17: r8 = r8 + r9
     20: r9 = r10
     22: jump @2
-      : @6
+      : @4
     24: r7 = r8
     26: r8 = 0x0
     28: r9 = 0x0
     30: fallthrough
-      : @7
-    31: ret
+      : @5
+    31: jump [r0 + 0]
 "#;
 }
