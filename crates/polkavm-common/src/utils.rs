@@ -320,10 +320,12 @@ pub fn parse_immediate(text: &str) -> Option<ParsedImmediate> {
     };
 
     let value = if let Some(text) = text.strip_prefix("0x") {
+        // or rather here?
         u64::from_str_radix(text, 16).ok()?
     } else if let Some(text) = text.strip_prefix("0b") {
         u64::from_str_radix(text, 2).ok()?
     } else {
+        // TODO handle i64 -> u32 here correctly?
         match text.parse::<i64>() {
             Ok(signed) => signed as u64,
             Err(_) => return None,
@@ -334,7 +336,7 @@ pub fn parse_immediate(text: &str) -> Option<ParsedImmediate> {
         return Some(ParsedImmediate::U64(value));
     }
 
-    if value < 0x7fffffff || cast(cast(value).truncate_to_u32()).to_u64_sign_extend() == value {
+    if value <= 0xffffffff || cast(cast(value).truncate_to_u32()).to_u64_sign_extend() == value {
         Some(ParsedImmediate::U32(cast(value).truncate_to_u32()))
     } else {
         Some(ParsedImmediate::U64(value))
@@ -344,9 +346,9 @@ pub fn parse_immediate(text: &str) -> Option<ParsedImmediate> {
 #[test]
 fn test_parse_immediate() {
     // "special cases"
-    assert_eq!(parse_immediate("0xffffffff"), Some(ParsedImmediate::U64(0xffffffff)));
+    assert_eq!(parse_immediate("0xffffffff"), Some(ParsedImmediate::U32(0xffffffff)));
     assert_eq!(parse_immediate("0xffffffff87654321"), Some(ParsedImmediate::U32(0x87654321)));
-    assert_eq!(parse_immediate("0x80000075"), Some(ParsedImmediate::U64(0x80000075)));
+    assert_eq!(parse_immediate("0x80000075"), Some(ParsedImmediate::U32(0x80000075)));
     // "normal cases"
     assert_eq!(parse_immediate("0x1234"), Some(ParsedImmediate::U32(0x1234)));
     assert_eq!(parse_immediate("0x12345678"), Some(ParsedImmediate::U32(0x12345678)));

@@ -1,4 +1,6 @@
-use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramParts, Reg};
+#![allow(clippy::print_stderr)]
+
+use polkavm::{Engine, InterruptKind, Module, ModuleConfig, ProgramBlob, ProgramCounter, ProgramParts, Reg};
 use polkavm_common::assembler::assemble;
 
 pub struct Testcase {
@@ -48,13 +50,16 @@ pub fn new_engine() -> Engine {
 pub fn disassemble(bytecode: Vec<u8>) -> Result<String, String> {
     let mut parts = ProgramParts::default();
     parts.code_and_jump_table = bytecode.into();
+    parts.is_64_bit = true;
     let blob = ProgramBlob::from_parts(parts).map_err(to_string)?;
 
     let mut disassembler =
         polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).map_err(to_string)?;
+
     disassembler.show_raw_bytes(false);
     disassembler.prefer_non_abi_reg_names(true);
-    disassembler.prefer_unaliased(false);
+    disassembler.prefer_unaliased(true);
+    disassembler.prefer_offset_jump_targets(false);
     disassembler.emit_header(false);
     disassembler.emit_exports(false);
 
@@ -107,7 +112,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
     module_config.set_step_tracing(true);
 
-    let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+    let module = Module::from_blob(engine, &module_config, blob.clone()).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     let mut initial_page_map = Vec::new();
@@ -177,25 +182,29 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, execute: bool) ->
     }
 
     let mut final_pc = initial_pc;
-    let expected_status = loop {
-        match instance.run().unwrap() {
-            InterruptKind::Finished => break "halt",
-            InterruptKind::Trap => break "trap",
-            InterruptKind::Ecalli(..) => todo!(),
-            InterruptKind::NotEnoughGas => break "out-of-gas",
-            InterruptKind::Segfault(..) => todo!(),
-            InterruptKind::Step => {
-                final_pc = instance.program_counter().unwrap();
-                continue;
+    let expected_status = if execute {
+        loop {
+            match instance.run().unwrap() {
+                InterruptKind::Finished => break "halt",
+                InterruptKind::Trap => break "trap",
+                InterruptKind::Ecalli(..) => todo!(),
+                InterruptKind::NotEnoughGas => break "out-of-gas",
+                InterruptKind::Segfault(..) => todo!(),
+                InterruptKind::Step => {
+                    final_pc = instance.program_counter().unwrap();
+                    continue;
+                }
             }
         }
+    } else {
+        "ok"
     };
 
     if expected_status != "halt" {
-        final_pc = instance.program_counter().unwrap();
+        final_pc = instance.program_counter().unwrap_or(ProgramCounter(0));
     }
 
-    if final_pc.0 != expected_final_pc {
+    if execute && final_pc.0 != expected_final_pc {
         let msg = format!("Unexpected final program counter for {name:?}: expected {expected_final_pc}, is {final_pc}");
         eprintln!("{}", msg);
         return Err(msg);
