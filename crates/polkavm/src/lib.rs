@@ -59,7 +59,6 @@ mod config;
 mod gas;
 mod interpreter;
 mod linker;
-mod page_set;
 #[cfg(feature = "std")]
 mod source_cache;
 mod utils;
@@ -90,6 +89,7 @@ mod module_cache;
 
 if_compiler_is_supported! {
     mod compiler;
+    mod page_set;
     mod sandbox;
 
     #[cfg(all(target_os = "linux", not(feature = "export-internals-for-testing")))]
@@ -139,8 +139,9 @@ pub mod program {
 pub type Gas = i64;
 
 pub use crate::api::{Engine, MemoryAccessError, Module, RawInstance, RegValue};
-pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
+pub use crate::config::{BackendKind, Config, CustomCodegen, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
+pub use crate::gas::{Cost, CostModel, CostModelRef};
 pub use crate::linker::{CallError, Caller, Instance, InstancePre, Linker};
 pub use crate::utils::{InterruptKind, Segfault};
 

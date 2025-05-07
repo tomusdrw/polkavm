@@ -6,13 +6,19 @@ use alloc::vec::Vec;
 use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
 use polkavm_common::cast::cast;
 use polkavm_common::program::{
-    build_static_dispatch_table, FrameKind, ISA32_V1_NoSbrk, ISA64_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode,
-    ProgramBlob, Reg, ISA32_V1, ISA64_V1,
+    FrameKind, ISA32_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode, ProgramBlob, Reg, ISA32_V1, ISA64_V1,
 };
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
 
+if_compiler_is_supported! {
+    use polkavm_common::program::{
+        build_static_dispatch_table, ISA64_V1_NoSbrk,
+    };
+}
+
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 use crate::error::{bail, bail_static, Error};
+use crate::gas::CostModelRef;
 use crate::interpreter::{InterpretedInstance, InterpretedModule};
 use crate::utils::{GuestInit, InterruptKind};
 use crate::{Gas, ProgramCounter};
@@ -31,6 +37,7 @@ if_compiler_is_supported! {
         use crate::sandbox::generic::Sandbox as SandboxGeneric;
 
         pub(crate) struct EngineState {
+            pub(crate) sandboxing_enabled: bool,
             pub(crate) sandbox_global: Option<crate::sandbox::GlobalStateKind>,
             pub(crate) sandbox_cache: Option<crate::sandbox::WorkerCacheKind>,
             compiler_cache: CompilerCache,
@@ -94,6 +101,7 @@ pub struct Engine {
     crosscheck: bool,
     state: Arc<EngineState>,
     allow_dynamic_paging: bool,
+    allow_experimental: bool,
 }
 
 impl Engine {
@@ -110,6 +118,14 @@ impl Engine {
 
         if !config.allow_experimental && config.crosscheck {
             bail!("cannot enable execution cross-checking: `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` is not enabled");
+        }
+
+        if !config.sandboxing_enabled {
+            if !config.allow_experimental {
+                bail!("cannot disable security sandboxing: `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` is not enabled");
+            } else {
+                log::warn!("SECURITY SANDBOXING IS DISABLED; THIS IS UNSUPPORTED; YOU HAVE BEEN WARNED");
+            }
         }
 
         let crosscheck = config.crosscheck;
@@ -160,6 +176,7 @@ impl Engine {
                     }
 
                     let state = Arc::new(EngineState {
+                        sandboxing_enabled: config.sandboxing_enabled,
                         sandbox_global: Some(sandbox_global),
                         sandbox_cache: Some(sandbox_cache),
                         compiler_cache: Default::default(),
@@ -171,6 +188,7 @@ impl Engine {
                     (Some(selected_sandbox), state)
                 } else {
                     (None, Arc::new(EngineState {
+                        sandboxing_enabled: config.sandboxing_enabled,
                         sandbox_global: None,
                         sandbox_cache: None,
                         compiler_cache: Default::default(),
@@ -194,12 +212,24 @@ impl Engine {
             crosscheck,
             state,
             allow_dynamic_paging: config.allow_dynamic_paging(),
+            allow_experimental: config.allow_experimental,
         })
     }
 
     /// Returns the backend used by the engine.
     pub fn backend(&self) -> BackendKind {
         self.selected_backend
+    }
+
+    /// Returns the PIDs of the idle worker processes. Only useful for debugging.
+    pub fn idle_worker_pids(&self) -> Vec<u32> {
+        if_compiler_is_supported! {
+            {
+                self.state.sandbox_cache.as_ref().map(|cache| cache.idle_worker_pids()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -226,6 +256,7 @@ impl CompiledModuleKind {
 }
 
 pub(crate) struct ModulePrivate {
+    #[allow(dead_code)]
     engine_state: Option<Arc<EngineState>>,
     crosscheck: bool,
 
@@ -240,6 +271,7 @@ pub(crate) struct ModulePrivate {
     page_size_mask: u32,
     page_shift: u32,
     instruction_set: RuntimeInstructionSet,
+    cost_model: CostModelRef,
     #[cfg(feature = "module-cache")]
     pub(crate) module_key: Option<ModuleKey>,
 }
@@ -282,8 +314,10 @@ impl Module {
         self.state().dynamic_paging
     }
 
-    pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
-        &self.state().compiled_module
+    if_compiler_is_supported! {
+        pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
+            &self.state().compiled_module
+        }
     }
 
     pub(crate) fn interpreted_module(&self) -> Option<&InterpretedModule> {
@@ -340,8 +374,14 @@ impl Module {
         self.round_to_page_size_down(value) + (u32::from((value & self.state().page_size_mask) != 0) << self.state().page_shift)
     }
 
-    pub(crate) fn address_to_page(&self, address: u32) -> u32 {
-        address >> self.state().page_shift
+    pub(crate) fn cost_model(&self) -> CostModelRef {
+        self.state().cost_model.clone()
+    }
+
+    if_compiler_is_supported! {
+        pub(crate) fn address_to_page(&self, address: u32) -> u32 {
+            address >> self.state().page_shift
+        }
     }
 
     /// Creates a new module by deserializing the program from the given `bytes`.
@@ -361,6 +401,15 @@ impl Module {
         if config.dynamic_paging() && !engine.allow_dynamic_paging {
             bail!("dynamic paging was not enabled; use `Config::set_allow_dynamic_paging` to enable it");
         }
+
+        if config.custom_codegen.is_some() && !engine.allow_experimental {
+            bail!("cannot use custom codegen: `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` is not enabled");
+        }
+
+        log::trace!(
+            "Creating new module from a {}-bit program blob",
+            if blob.is_64_bit() { 64 } else { 32 }
+        );
 
         #[cfg(feature = "module-cache")]
         let module_key = {
@@ -407,24 +456,26 @@ impl Module {
             }
         };
 
-        let exports = {
-            log::trace!("Parsing exports...");
-            let mut exports = Vec::with_capacity(1);
-            for export in blob.exports() {
-                log::trace!("  Export at {}: {}", export.program_counter(), export.symbol());
-                if config.is_strict && cast(export.program_counter().0).to_usize() >= blob.code().len() {
-                    bail!(
-                        "out of range export found; export {} points to code offset {}, while the code blob is only {} bytes",
-                        export.symbol(),
-                        export.program_counter(),
-                        blob.code().len(),
-                    );
-                }
+        if_compiler_is_supported! {
+            let exports = {
+                log::trace!("Parsing exports...");
+                let mut exports = Vec::with_capacity(1);
+                for export in blob.exports() {
+                    log::trace!("  Export at {}: {}", export.program_counter(), export.symbol());
+                    if config.is_strict && cast(export.program_counter().0).to_usize() >= blob.code().len() {
+                        bail!(
+                            "out of range export found; export {} points to code offset {}, while the code blob is only {} bytes",
+                            export.symbol(),
+                            export.program_counter(),
+                            blob.code().len(),
+                        );
+                    }
 
-                exports.push(export);
-            }
-            exports
-        };
+                    exports.push(export);
+                }
+                exports
+            };
+        }
 
         let init = GuestInit {
             page_size: config.page_size,
@@ -456,6 +507,7 @@ impl Module {
                     config.step_tracing || engine.crosscheck,
                     cast(blob.code().len()).assert_always_fits_in_u32(),
                     init,
+                    config.cost_model.clone(),
                 )?;
 
                 if config.allow_sbrk {
@@ -588,6 +640,7 @@ impl Module {
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,
+            cost_model: config.cost_model().clone(),
 
             #[cfg(feature = "module-cache")]
             module_key,
@@ -764,7 +817,7 @@ impl Module {
             return None;
         }
 
-        let gas = crate::gas::calculate_for_block(self.instructions_bounded_at(code_offset));
+        let gas = crate::gas::calculate_for_block(self.state().cost_model.clone(), self.instructions_bounded_at(code_offset));
         Some(i64::from(gas.0))
     }
 
@@ -845,6 +898,12 @@ impl core::fmt::Display for MemoryAccessError {
                 write!(fmt, "memory access failed: {error}")
             }
         }
+    }
+}
+
+impl From<MemoryAccessError> for alloc::string::String {
+    fn from(error: MemoryAccessError) -> alloc::string::String {
+        alloc::string::ToString::to_string(&error)
     }
 }
 
@@ -1268,6 +1327,23 @@ impl RawInstance {
         Ok(buffer)
     }
 
+    /// A convenience function to read an `u64` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u64(&self, address: u32) -> Result<u64, MemoryAccessError> {
+        let mut buffer = [0; 8];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(u64::from_le_bytes(buffer))
+    }
+
+    /// A convenience function to write an `u64` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u64(&mut self, address: u32, value: u64) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &value.to_le_bytes())
+    }
+
     /// A convenience function to read an `u32` from the VM's memory.
     ///
     /// This is equivalent to calling [`RawInstance::read_memory_into`].
@@ -1357,6 +1433,37 @@ impl RawInstance {
         }
 
         result
+    }
+
+    /// Read-only protects a given memory region.
+    ///
+    /// Is only supported when dynamic paging is enabled.
+    pub fn protect_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        if !self.module.is_dynamic_paging() {
+            return Err(MemoryAccessError::Error(
+                "protecting memory is only possible on modules with dynamic paging".into(),
+            ));
+        }
+
+        if length == 0 {
+            return Ok(());
+        }
+
+        if address < 0x10000 {
+            return Err(MemoryAccessError::OutOfRangeAccess {
+                address,
+                length: u64::from(length),
+            });
+        }
+
+        if u64::from(address) + u64::from(length) > 0x100000000 {
+            return Err(MemoryAccessError::OutOfRangeAccess {
+                address,
+                length: u64::from(length),
+            });
+        }
+
+        access_backend!(self.backend, |mut backend| backend.protect_memory(address, length))
     }
 
     /// Frees the given page(s).

@@ -9,14 +9,13 @@ use polkavm_common::{
     utils::{align_to_next_page_usize, slice_assume_init_mut},
     zygote::{
         AddressTable, AddressTablePacked, ExtTable, ExtTablePacked, VmCtx, VmFd, VmMap, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_GUEST_ECALLI,
-        VMCTX_FUTEX_GUEST_NOT_ENOUGH_GAS, VMCTX_FUTEX_GUEST_SIGNAL, VMCTX_FUTEX_GUEST_STEP, VMCTX_FUTEX_GUEST_TRAP, VMCTX_FUTEX_IDLE,
-        VM_ADDR_NATIVE_CODE,
+        VMCTX_FUTEX_GUEST_NOT_ENOUGH_GAS, VMCTX_FUTEX_GUEST_PAGEFAULT, VMCTX_FUTEX_GUEST_SIGNAL, VMCTX_FUTEX_GUEST_STEP,
+        VMCTX_FUTEX_GUEST_TRAP, VMCTX_FUTEX_IDLE, VM_ADDR_NATIVE_CODE,
     },
 };
 
 pub use linux_raw::Error;
 
-use core::cell::UnsafeCell;
 use core::ffi::{c_int, c_uint};
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
@@ -40,8 +39,58 @@ pub struct GlobalState {
     zygote_memfd: Fd,
 }
 
-const UFFD_REQUIRED_FEATURES: u64 =
-    (linux_raw::UFFD_FEATURE_MISSING_SHMEM | linux_raw::UFFD_FEATURE_MINOR_SHMEM | linux_raw::UFFD_FEATURE_WP_HUGETLBFS_SHMEM) as u64;
+const UFFD_REQUIRED_FEATURES: u64 = (linux_raw::UFFD_FEATURE_MISSING_SHMEM
+    | linux_raw::UFFD_FEATURE_MINOR_SHMEM
+    | linux_raw::UFFD_FEATURE_WP_HUGETLBFS_SHMEM
+    | linux_raw::UFFD_FEATURE_SIGBUS) as u64;
+
+const SANDBOX_FLAGS: u64 = (linux_raw::CLONE_NEWCGROUP
+    | linux_raw::CLONE_NEWIPC
+    | linux_raw::CLONE_NEWNET
+    | linux_raw::CLONE_NEWNS
+    | linux_raw::CLONE_NEWPID
+    | linux_raw::CLONE_NEWUSER
+    | linux_raw::CLONE_NEWUTS) as u64;
+
+enum Fork {
+    Child,
+    Host(ChildProcess),
+}
+
+fn clone(flags: u64) -> Result<Fork, Error> {
+    let mut pidfd: c_int = -1;
+    let args = CloneArgs {
+        flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | flags,
+        pidfd: &mut pidfd,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: 0,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+    };
+
+    let mut child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
+
+    if child_pid < 0 {
+        // Fallback for Linux versions older than 5.5.
+        let error = Error::from_syscall("failed to clone the process", child_pid);
+        child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, flags, 0, 0, 0, 0) };
+
+        if child_pid < 0 {
+            return Err(error.unwrap_err());
+        }
+    }
+
+    if child_pid == 0 {
+        Ok(Fork::Child)
+    } else {
+        Ok(Fork::Host(ChildProcess {
+            pid: child_pid as c_int,
+            pidfd: if pidfd < 0 { None } else { Some(Fd::from_raw_unchecked(pidfd)) },
+        }))
+    }
+}
 
 impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
@@ -71,11 +120,54 @@ impl GlobalState {
 
             if (api.features & UFFD_REQUIRED_FEATURES) != UFFD_REQUIRED_FEATURES {
                 return Err(Error::from(
-                    "not all required userfaultfd features are available; you need to update your Linux kernel to version 5.19 or newer",
+                    "not all required userfaultfd features are available; you need to update your Linux kernel to version 6.8 or newer",
                 ));
             }
 
             userfaultfd.close()?;
+
+            let utsname = linux_raw::sys_uname()?;
+            fn kernel_version(utsname: &linux_raw::new_utsname) -> Option<(u32, u32)> {
+                let release: &[core::ffi::c_char] = &utsname.release;
+                let release: &[u8] = unsafe { core::slice::from_raw_parts(release.as_ptr().cast(), release.len()) };
+                let mut release = core::ffi::CStr::from_bytes_until_nul(release).ok()?.to_str().ok()?.split('.');
+                let major: u32 = release.next()?.parse().ok()?;
+                let minor: u32 = release.next()?.parse().ok()?;
+                Some((major, minor))
+            }
+
+            if let Some((kernel_major, kernel_minor)) = kernel_version(&utsname) {
+                log::debug!("Detected Linux kernel: {kernel_major}.{kernel_minor}");
+                if kernel_major < 6 || (kernel_major == 6 && kernel_minor < 8) {
+                    return Err(Error::from(
+                        format!("too old Linux kernel detected: {kernel_major}.{kernel_minor}; you need to update your Linux kernel to version 6.8 or newer")
+                    ));
+                }
+            } else {
+                log::warn!("Failed to parse the kernel version; this is a bug, please report it!");
+            }
+        }
+
+        match clone(SANDBOX_FLAGS)? {
+            Fork::Child => {
+                let exit_code = if linux_raw::sys_sethostname("localhost").is_err() { 1 } else { 0 };
+                let _ = linux_raw::sys_exit(exit_code);
+                linux_raw::abort();
+            }
+            Fork::Host(mut child) => match child.check_status(false)? {
+                ChildStatus::Exited(0) => {}
+                ChildStatus::Exited(1) => {
+                    if std::fs::read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                        .map(|blob| blob == b"1\n")
+                        .unwrap_or(false)
+                    {
+                        return Err(Error::from("failed to create a sandboxed worker process; run 'sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' to enable unprivileged user namespaces"));
+                    }
+                }
+                status => {
+                    return Err(Error::from(format!("unexpected sandbox child status: {status:?}")));
+                }
+            },
         }
 
         let zygote_memfd = prepare_zygote()?;
@@ -89,17 +181,25 @@ impl GlobalState {
 
 pub struct SandboxConfig {
     enable_logger: bool,
+    enable_sandboxing: bool,
 }
 
 impl SandboxConfig {
     pub fn new() -> Self {
-        SandboxConfig { enable_logger: false }
+        SandboxConfig {
+            enable_logger: false,
+            enable_sandboxing: true,
+        }
     }
 }
 
 impl super::SandboxConfig for SandboxConfig {
     fn enable_logger(&mut self, value: bool) {
         self.enable_logger = value;
+    }
+
+    fn enable_sandboxing(&mut self, value: bool) {
+        self.enable_sandboxing = value;
     }
 }
 
@@ -219,10 +319,6 @@ impl ChildStatus {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
     }
-
-    pub fn is_trapped(&self) -> bool {
-        matches!(self, Self::Trapped)
-    }
 }
 
 struct Signal(c_int);
@@ -287,17 +383,8 @@ impl ChildProcess {
         }
     }
 
-    fn check_status(&mut self, non_blocking: bool) -> Result<ChildStatus, Error> {
-        // The __WALL here is needed since we're not specifying an exit signal
-        // when cloning the child process, so we'd get an ECHILD error without this flag.
-        //
-        // (And we're not using __WCLONE since that doesn't work for children which ran execve.)
-        let mut flags = linux_raw::WEXITED | linux_raw::__WALL;
-        if non_blocking {
-            flags |= linux_raw::WNOHANG;
-        }
-
-        match self.waitid(flags) {
+    fn extract_status(result: Result<linux_raw::siginfo_t, Error>) -> Result<ChildStatus, Error> {
+        match result {
             Ok(ok) => unsafe {
                 if ok.si_signo() == 0 && ok.si_pid() == 0 {
                     Ok(ChildStatus::Running)
@@ -327,6 +414,19 @@ impl ChildProcess {
                 }
             }
         }
+    }
+
+    fn check_status(&mut self, non_blocking: bool) -> Result<ChildStatus, Error> {
+        // The __WALL here is needed since we're not specifying an exit signal
+        // when cloning the child process, so we'd get an ECHILD error without this flag.
+        //
+        // (And we're not using __WCLONE since that doesn't work for children which ran execve.)
+        let mut flags = linux_raw::WEXITED | linux_raw::__WALL;
+        if non_blocking {
+            flags |= linux_raw::WNOHANG;
+        }
+
+        Self::extract_status(self.waitid(flags))
     }
 
     fn send_signal(&mut self, signal: c_uint) -> Result<(), Error> {
@@ -636,11 +736,11 @@ struct ChildFds {
     logging_pipe: Option<Fd>,
 }
 
-unsafe fn child_main(uid_map: &str, gid_map: &str, fds: ChildFds) -> Result<(), Error> {
+unsafe fn child_main(uid_map: &str, gid_map: &str, fds: ChildFds, sandboxing_enabled: bool) -> Result<(), Error> {
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")?;
 
-    if !cfg!(polkavm_dev_debug_zygote) {
+    if sandboxing_enabled {
         // Overwrite the hostname and domainname.
         linux_raw::sys_sethostname("localhost")?;
         linux_raw::sys_setdomainname("localhost")?;
@@ -740,7 +840,7 @@ unsafe fn child_main(uid_map: &str, gid_map: &str, fds: ChildFds) -> Result<(), 
     let fd_zygote = move_fd(fd_zygote, FD_ZYGOTE, linux_raw::O_CLOEXEC)?;
     close_fd_range(NEXT_FREE_FD, c_int::MAX)?;
 
-    if !cfg!(polkavm_dev_debug_zygote) {
+    if sandboxing_enabled {
         // Hide the host filesystem.
         let mount_flags = linux_raw::MS_REC | linux_raw::MS_NODEV | linux_raw::MS_NOEXEC | linux_raw::MS_NOSUID | linux_raw::MS_RDONLY;
         linux_raw::sys_mount(cstr!("none"), cstr!("/tmp"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
@@ -954,16 +1054,6 @@ unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
     *vmctx.message_length.get() = length as u32;
 }
 
-struct UffdBuffer(Arc<UnsafeCell<linux_raw::uffd_msg>>);
-
-unsafe impl Send for UffdBuffer {}
-unsafe impl Sync for UffdBuffer {}
-
-struct Pagefault {
-    address: u64,
-    registers_modified: bool,
-}
-
 #[derive(Copy, Clone)]
 enum SandboxState {
     Idle,
@@ -975,12 +1065,7 @@ pub struct Sandbox {
     _lifetime_pipe: Fd,
     vmctx_mmap: Mmap,
     memory_mmap: Mmap,
-    iouring: Option<linux_raw::IoUring>,
-    iouring_futex_wait_queued: bool,
-    iouring_uffd_read_queued: bool,
-    iouring_timeout_queued: bool,
     userfaultfd: Fd,
-    uffd_msg: UffdBuffer,
     child: ChildProcess,
 
     count_wait_loop_start: u64,
@@ -993,12 +1078,11 @@ pub struct Sandbox {
     is_program_counter_valid: bool,
     next_program_counter: Option<ProgramCounter>,
     next_program_counter_changed: bool,
-    pending_pagefault: Option<Pagefault>,
     page_set: PageSet,
     dynamic_paging_enabled: bool,
-    idle_regs: linux_raw::user_regs_struct,
     aux_data_address: u32,
     aux_data_length: u32,
+    is_borked: bool,
 }
 
 impl Drop for Sandbox {
@@ -1222,37 +1306,14 @@ impl super::Sandbox for Sandbox {
         // TODO: If not using userfaultfd then don't mmap all of this immediately.
         let (memory_memfd, memory_mmap) = prepare_memory()?;
 
+        let sandboxing_enabled = config.enable_sandboxing && !cfg!(polkavm_dev_debug_zygote);
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
         let vmctx = unsafe { &*vmctx_mmap.as_ptr().cast::<VmCtx>() };
         vmctx.init.logging_enabled.store(config.enable_logger, Ordering::Relaxed);
         vmctx.init.uffd_available.store(global.uffd_available, Ordering::Relaxed);
-        vmctx.init.sandbox_disabled.store(cfg!(polkavm_dev_debug_zygote), Ordering::Relaxed);
+        vmctx.init.sandbox_disabled.store(!sandboxing_enabled, Ordering::Relaxed);
 
-        let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
-            u64::from(
-                linux_raw::CLONE_NEWCGROUP
-                    | linux_raw::CLONE_NEWIPC
-                    | linux_raw::CLONE_NEWNET
-                    | linux_raw::CLONE_NEWNS
-                    | linux_raw::CLONE_NEWPID
-                    | linux_raw::CLONE_NEWUSER
-                    | linux_raw::CLONE_NEWUTS,
-            )
-        } else {
-            0
-        };
-
-        let mut pidfd: c_int = -1;
-        let args = CloneArgs {
-            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | sandbox_flags,
-            pidfd: &mut pidfd,
-            child_tid: 0,
-            parent_tid: 0,
-            exit_signal: 0,
-            stack: 0,
-            stack_size: 0,
-            tls: 0,
-        };
+        let sandbox_flags = if sandboxing_enabled { SANDBOX_FLAGS } else { 0 };
 
         let uid = linux_raw::sys_getuid()?;
         let gid = linux_raw::sys_getgid()?;
@@ -1260,55 +1321,47 @@ impl super::Sandbox for Sandbox {
         let uid_map = format!("0 {} 1\n", uid);
         let gid_map = format!("0 {} 1\n", gid);
 
-        // Fork a new process.
-        let mut child_pid =
-            unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
+        let mut child = match clone(sandbox_flags)? {
+            Fork::Child => {
+                // We're in the child.
+                //
+                // Calling into libc from here risks a deadlock as other threads might have
+                // been holding onto internal libc locks while we were cloning ourselves,
+                // so from now on we can't use anything from libc anymore.
+                core::mem::forget(sigset);
 
-        if child_pid < 0 {
-            // Fallback for Linux versions older than 5.5.
-            let error = Error::from_last_os_error("clone");
-            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, sandbox_flags, 0, 0, 0, 0) };
+                unsafe {
+                    match child_main(
+                        &uid_map,
+                        &gid_map,
+                        ChildFds {
+                            zygote: linux_raw::Fd::from_raw_unchecked(global.zygote_memfd.raw()),
+                            socket: child_socket,
+                            vmctx: vmctx_memfd,
+                            shm: linux_raw::Fd::from_raw_unchecked(global.shared_memory.fd().raw()),
+                            mem: memory_memfd,
+                            lifetime_pipe: lifetime_pipe_child,
+                            logging_pipe: logger_tx,
+                        },
+                        sandboxing_enabled,
+                    ) {
+                        Ok(()) => {
+                            // This is impossible.
+                            abort();
+                        }
+                        Err(error) => {
+                            let vmctx = &*vmctx_mmap.as_ptr().cast::<VmCtx>();
+                            set_message(vmctx, format_args!("fatal error while spawning child: {error}"));
 
-            if child_pid < 0 {
-                return Err(error);
-            }
-        }
-
-        if child_pid == 0 {
-            // We're in the child.
-            //
-            // Calling into libc from here risks a deadlock as other threads might have
-            // been holding onto internal libc locks while we were cloning ourselves,
-            // so from now on we can't use anything from libc anymore.
-            core::mem::forget(sigset);
-
-            unsafe {
-                match child_main(
-                    &uid_map,
-                    &gid_map,
-                    ChildFds {
-                        zygote: linux_raw::Fd::from_raw_unchecked(global.zygote_memfd.raw()),
-                        socket: child_socket,
-                        vmctx: vmctx_memfd,
-                        shm: linux_raw::Fd::from_raw_unchecked(global.shared_memory.fd().raw()),
-                        mem: memory_memfd,
-                        lifetime_pipe: lifetime_pipe_child,
-                        logging_pipe: logger_tx,
-                    },
-                ) {
-                    Ok(()) => {
-                        // This is impossible.
-                        abort();
-                    }
-                    Err(error) => {
-                        let vmctx = &*vmctx_mmap.as_ptr().cast::<VmCtx>();
-                        set_message(vmctx, format_args!("fatal error while spawning child: {error}"));
-
-                        abort();
+                            abort();
+                        }
                     }
                 }
             }
-        }
+            Fork::Host(child) => child,
+        };
+
+        let child_pid = child.pid;
 
         child_socket.close()?;
         vmctx_memfd.close()?;
@@ -1358,11 +1411,6 @@ impl super::Sandbox for Sandbox {
                 })
                 .map_err(|error| Error::from_os_error("failed to spawn logger thread", error))?;
         }
-
-        let mut child = ChildProcess {
-            pid: child_pid as c_int,
-            pidfd: if pidfd < 0 { None } else { Some(Fd::from_raw_unchecked(pidfd)) },
-        };
 
         // We're in the parent. Restore the signal mask.
         sigset.unblock()?;
@@ -1509,9 +1557,7 @@ impl super::Sandbox for Sandbox {
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
 
-        let (iouring, userfaultfd) = if global.uffd_available {
-            let iouring = linux_raw::IoUring::new(3)?;
-
+        let userfaultfd = if global.uffd_available {
             let userfaultfd = linux_raw::recvfd(socket.borrow()).map_err(|error| {
                 let mut error = format!("failed to fetch the userfaultfd from the child process: {error}");
                 if let Some(message) = get_message(vmctx) {
@@ -1530,11 +1576,9 @@ impl super::Sandbox for Sandbox {
             linux_raw::sys_uffdio_api(userfaultfd.borrow(), &mut api)
                 .map_err(|error| Error::from(format!("failed to initialize the userfaultfd API: {error}")))?;
 
-            linux_raw::sys_ptrace_seize(child.pid)?;
-
-            (Some(iouring), userfaultfd)
+            userfaultfd
         } else {
-            (None, Fd::from_raw_unchecked(-1))
+            Fd::from_raw_unchecked(-1)
         };
 
         // Close the socket; we don't need it anymore.
@@ -1543,50 +1587,11 @@ impl super::Sandbox for Sandbox {
         // Wait for the child to finish initialization.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
 
-        let mut idle_regs = linux_raw::user_regs_struct::default();
-        if global.uffd_available {
-            // We need to be able to return to idle from a pending segfault,
-            // so let's grab the registers which will allow us to do that.
-
-            // First grab all of the general-purpose registers.
-            linux_raw::sys_ptrace_interrupt(child.pid)?;
-            let status = child.check_status(false)?;
-            if !status.is_trapped() {
-                log::error!("Child #{}: expected child to trap, found: {status}", child.pid);
-                return Err(Error::from_str("internal error: unexpected child status"));
-            }
-
-            idle_regs = linux_raw::sys_ptrace_getregs(child.pid)?;
-            linux_raw::sys_ptrace_continue(child.pid, None)?;
-
-            // Then grab the worker's idle longjmp registers.
-            vmctx.jump_into.store(ZYGOTE_TABLES.1.ext_fetch_idle_regs, Ordering::Relaxed);
-            vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-            linux_raw::sys_futex_wake_one(&vmctx.futex)?;
-            wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
-
-            idle_regs.rax = 1;
-            idle_regs.rip = vmctx.init.idle_regs.rip.load(Ordering::Relaxed);
-            idle_regs.rbx = vmctx.init.idle_regs.rbx.load(Ordering::Relaxed);
-            idle_regs.sp = vmctx.init.idle_regs.rsp.load(Ordering::Relaxed);
-            idle_regs.rbp = vmctx.init.idle_regs.rbp.load(Ordering::Relaxed);
-            idle_regs.r12 = vmctx.init.idle_regs.r12.load(Ordering::Relaxed);
-            idle_regs.r13 = vmctx.init.idle_regs.r13.load(Ordering::Relaxed);
-            idle_regs.r14 = vmctx.init.idle_regs.r14.load(Ordering::Relaxed);
-            idle_regs.r15 = vmctx.init.idle_regs.r15.load(Ordering::Relaxed);
-        }
-
         Ok(Sandbox {
             _lifetime_pipe: lifetime_pipe_host,
             vmctx_mmap,
             memory_mmap,
-            iouring,
-            iouring_futex_wait_queued: false,
-            iouring_uffd_read_queued: false,
-            iouring_timeout_queued: false,
             userfaultfd,
-            #[allow(clippy::arc_with_non_send_sync)]
-            uffd_msg: UffdBuffer(Arc::new(UnsafeCell::new(linux_raw::uffd_msg::default()))),
             child,
 
             count_wait_loop_start: 0,
@@ -1599,12 +1604,11 @@ impl super::Sandbox for Sandbox {
             is_program_counter_valid: false,
             next_program_counter: None,
             next_program_counter_changed: true,
-            pending_pagefault: None,
             page_set: PageSet::new(),
             dynamic_paging_enabled: false,
-            idle_regs,
             aux_data_address: 0,
             aux_data_length: 0,
+            is_borked: false,
         })
     }
 
@@ -1727,7 +1731,7 @@ impl super::Sandbox for Sandbox {
                 &mut linux_raw::uffdio_register {
                     range: linux_raw::uffdio_range {
                         start: 0x10000,
-                        len: u64::from(u32::MAX) + 1 - 0x20000,
+                        len: u64::from(u32::MAX) + 1 - 0x10000,
                     },
                     mode: linux_raw::UFFDIO_REGISTER_MODE_MISSING | linux_raw::UFFDIO_REGISTER_MODE_WP,
                     ..linux_raw::uffdio_register::default()
@@ -1740,6 +1744,10 @@ impl super::Sandbox for Sandbox {
     }
 
     fn recycle(&mut self, _global: &Self::GlobalState) -> Result<(), Self::Error> {
+        if self.is_borked {
+            return Err(Error::from_str("broken sandbox"));
+        }
+
         log::trace!("Recycling sandbox #{}", self.child.pid);
         if self.dynamic_paging_enabled {
             self.free_pages(0x10000, 0xffff0000)?;
@@ -1748,23 +1756,14 @@ impl super::Sandbox for Sandbox {
         self.module = None;
         self.page_set.clear();
 
-        if self.pending_pagefault.take().is_some() {
-            self.cancel_pagefault()?;
-            Ok(())
-        } else {
-            self.vmctx().jump_into.store(ZYGOTE_TABLES.1.ext_recycle, Ordering::Relaxed);
-            self.wake_oneshot_and_expect_idle()
-        }
+        self.vmctx().jump_into.store(ZYGOTE_TABLES.1.ext_recycle, Ordering::Relaxed);
+        self.wake_oneshot_and_expect_idle()
     }
 
     fn run(&mut self) -> Result<InterruptKind, Self::Error> {
         if self.module.is_none() {
             return Err(Error::from_str("no module loaded into the sandbox"));
         };
-
-        if self.pending_pagefault.take().is_some() {
-            self.cancel_pagefault()?;
-        }
 
         if self.next_program_counter_changed {
             let Some(pc) = self.next_program_counter.take() else {
@@ -1801,27 +1800,13 @@ impl super::Sandbox for Sandbox {
             );
         };
 
-        if let Some(pagefault) = self.pending_pagefault.take() {
-            if pagefault.registers_modified {
-                self.upload_registers()?;
-            }
-
-            // This acts exactly the same as `UFFDIO_WAKE`.
-            log::trace!(
-                "Child #{}: sys_ptrace_continue after page fault at 0x{:x}",
-                self.child.pid,
-                pagefault.address
-            );
-            linux_raw::sys_ptrace_continue(self.child.pid, None)?;
-        } else {
-            let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
-            debug_assert_eq!(self.vmctx().futex.load(Ordering::Relaxed) & 1, VMCTX_FUTEX_IDLE);
-            self.vmctx()
-                .jump_into
-                .store(compiled_module.sandbox_program.0.sysenter_address, Ordering::Relaxed);
-            self.wake_worker()?;
-            self.is_program_counter_valid = true;
-        }
+        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+        debug_assert_eq!(self.vmctx().futex.load(Ordering::Relaxed) & 1, VMCTX_FUTEX_IDLE);
+        self.vmctx()
+            .jump_into
+            .store(compiled_module.sandbox_program.0.sysenter_address, Ordering::Relaxed);
+        self.wake_worker()?;
+        self.is_program_counter_valid = true;
 
         let result = self.wait()?;
         if self.module.as_ref().unwrap().gas_metering() == Some(GasMeteringKind::Async) && self.gas() < 0 {
@@ -1860,10 +1845,6 @@ impl super::Sandbox for Sandbox {
     }
 
     fn set_reg(&mut self, reg: Reg, mut value: RegValue) {
-        if let Some(ref mut pagefault) = self.pending_pagefault {
-            pagefault.registers_modified = true;
-        }
-
         let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
         if compiled_module.bitness == Bitness::B32 {
             value &= 0xffffffff;
@@ -2122,6 +2103,28 @@ impl super::Sandbox for Sandbox {
         Ok(())
     }
 
+    fn protect_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        assert!(self.dynamic_paging_enabled);
+
+        log::trace!(
+            "Protecting memory: 0x{:x}-0x{:x} ({} bytes)",
+            address,
+            address as usize + length as usize,
+            length
+        );
+
+        let mut arg: linux_raw::uffdio_writeprotect = Default::default();
+        arg.range.start = u64::from(address);
+        arg.range.len = u64::from(length);
+        arg.mode = linux_raw::UFFDIO_WRITEPROTECT_MODE_WP;
+
+        if let Err(error) = linux_raw::sys_uffdio_writeprotect(self.userfaultfd.borrow(), &mut arg) {
+            return Err(MemoryAccessError::Error(error.into()));
+        }
+
+        Ok(())
+    }
+
     fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Self::Error> {
         if !self.dynamic_paging_enabled {
             todo!();
@@ -2236,6 +2239,38 @@ impl Sandbox {
         self.wait()?.expect_idle()
     }
 
+    fn handle_guest_signal(&mut self, machine_code_address: u64) -> Result<Interrupt, Error> {
+        use crate::sandbox::Sandbox;
+
+        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+        let Some(machine_code_offset) = machine_code_address.checked_sub(compiled_module.native_code_origin) else {
+            return Err(Error::from_str("internal error: address underflow after a trap"));
+        };
+
+        let is_out_of_gas = match compiled_module.bitness {
+            Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::on_signal_trap(
+                compiled_module,
+                self.gas_metering.is_some(),
+                machine_code_offset,
+                self.vmctx(),
+            ),
+            Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::on_signal_trap(
+                compiled_module,
+                self.gas_metering.is_some(),
+                machine_code_offset,
+                self.vmctx(),
+            ),
+        }
+        .map_err(Error::from_str)?;
+
+        self.is_program_counter_valid = true;
+        if is_out_of_gas {
+            Ok(Interrupt::NotEnoughGas)
+        } else {
+            Ok(Interrupt::Trap)
+        }
+    }
+
     #[inline(never)]
     #[cold]
     fn wait(&mut self) -> Result<Interrupt, Error> {
@@ -2261,32 +2296,7 @@ impl Sandbox {
                 }
 
                 let machine_code_address = self.vmctx().rip.load(Ordering::Relaxed);
-                let Some(machine_code_offset) = machine_code_address.checked_sub(compiled_module.native_code_origin) else {
-                    return Err(Error::from_str("internal error: address underflow after a trap"));
-                };
-
-                let is_out_of_gas = match compiled_module.bitness {
-                    Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::on_signal_trap(
-                        compiled_module,
-                        self.gas_metering.is_some(),
-                        machine_code_offset,
-                        self.vmctx(),
-                    ),
-                    Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::on_signal_trap(
-                        compiled_module,
-                        self.gas_metering.is_some(),
-                        machine_code_offset,
-                        self.vmctx(),
-                    ),
-                }
-                .map_err(Error::from_str)?;
-
-                self.is_program_counter_valid = true;
-                if is_out_of_gas {
-                    return Ok(Interrupt::NotEnoughGas);
-                } else {
-                    return Ok(Interrupt::Trap);
-                }
+                return self.handle_guest_signal(machine_code_address);
             }
 
             if state == VMCTX_FUTEX_GUEST_ECALLI {
@@ -2310,172 +2320,100 @@ impl Sandbox {
                 return Ok(Interrupt::Step);
             }
 
+            if state == VMCTX_FUTEX_GUEST_PAGEFAULT {
+                core::sync::atomic::fence(Ordering::Acquire);
+
+                let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
+                if compiled_module.bitness == Bitness::B32 {
+                    for reg_value in &self.vmctx().regs {
+                        reg_value.fetch_and(0xffffffff, Ordering::Relaxed);
+                    }
+                }
+
+                let machine_code_address = self.vmctx().rip.load(Ordering::Relaxed);
+                let address = self.vmctx().arg.load(Ordering::Relaxed);
+                log::trace!(
+                    "Child #{}: pagefault: rip=0x{machine_code_address:x}, address=0x{address:x}",
+                    self.child.pid
+                );
+                let page_size = get_native_page_size() as u32;
+                let page_address = address & !(page_size - 1);
+
+                let Some(machine_code_offset) = machine_code_address.checked_sub(compiled_module.native_code_origin) else {
+                    return Err(Error::from_str("internal error: address underflow after a segfault"));
+                };
+
+                match compiled_module.bitness {
+                    Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::on_page_fault(
+                        compiled_module,
+                        self.gas_metering.is_some(),
+                        machine_code_address,
+                        machine_code_offset,
+                        self.vmctx(),
+                    ),
+                    Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::on_page_fault(
+                        compiled_module,
+                        self.gas_metering.is_some(),
+                        machine_code_address,
+                        machine_code_offset,
+                        self.vmctx(),
+                    ),
+                }
+                .map_err(Error::from_str)?;
+
+                self.is_program_counter_valid = true;
+                return Ok(Interrupt::Segfault(Segfault { page_address, page_size }));
+            }
+
             if state != VMCTX_FUTEX_BUSY {
                 log::error!("Unexpected worker process state: {state}");
                 return Err(Error::from_str("internal error: unexpected worker process state"));
             }
 
-            if self.dynamic_paging_enabled {
-                let iouring = self.iouring.as_mut().unwrap();
-
-                const IO_URING_JOB_FUTEX_WAIT: u64 = 1;
-                const IO_URING_JOB_USERFAULTFD_READ: u64 = 2;
-                const IO_URING_JOB_TIMEOUT: u64 = 3;
-
-                if !self.iouring_futex_wait_queued {
-                    self.count_futex_wait += 1;
-                    let vmctx = unsafe { &*self.vmctx_mmap.as_ptr().cast::<VmCtx>() };
-                    iouring
-                        .queue_futex_wait(IO_URING_JOB_FUTEX_WAIT, &vmctx.futex, VMCTX_FUTEX_BUSY)
-                        .expect("internal error: io_uring queue overflow");
-                    self.iouring_futex_wait_queued = true;
-                }
-
-                if !self.iouring_uffd_read_queued {
-                    iouring
-                        .queue_read(
-                            IO_URING_JOB_USERFAULTFD_READ,
-                            self.userfaultfd.borrow(),
-                            self.uffd_msg.0.get().cast(),
-                            core::mem::size_of::<linux_raw::uffd_msg>() as u32,
-                        )
-                        .expect("internal error: io_uring queue overflow");
-                    self.iouring_uffd_read_queued = true;
-                }
-
-                if !self.iouring_timeout_queued {
-                    iouring
-                        .queue_timeout(IO_URING_JOB_TIMEOUT, 1, Duration::from_millis(100))
-                        .expect("internal error: io_uring queue overflow");
-                    self.iouring_timeout_queued = true;
-                }
-
-                unsafe {
-                    iouring.submit_and_wait(1).expect("internal error: io_uring failed");
-                }
-
-                while let Some(job) = self.iouring.as_mut().unwrap().pop_finished() {
-                    // Fetch again to appease the borrow checker.
-                    if job.user_data == IO_URING_JOB_FUTEX_WAIT {
-                        self.iouring_futex_wait_queued = false;
-                    } else if job.user_data == IO_URING_JOB_USERFAULTFD_READ {
-                        self.iouring_uffd_read_queued = false;
-                        if job.res == -(linux_raw::ERESTARTSYS as i32) {
-                            log::trace!("Child #{}: ERESTARTSYS", self.child.pid);
-                            continue 'outer;
-                        }
-                        job.to_result()?;
-
-                        let msg = unsafe { &mut *self.uffd_msg.0.get() };
-                        let event = u32::from(core::mem::replace(&mut msg.event, 0));
-                        if event == linux_raw::UFFD_EVENT_PAGEFAULT {
-                            let pagefault = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(msg.arg.pagefault)) };
-                            let address = pagefault.address;
-                            let is_minor = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_MINOR)) != 0;
-                            let is_write = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_WRITE)) != 0;
-                            let is_wp = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_WP)) != 0;
-
-                            log::trace!(
-                                "Child #{}: pagefault: address=0x{address:x}, minor={is_minor}, write={is_write}, wp={is_wp}",
-                                self.child.pid
-                            );
-
-                            self.pending_pagefault = Some(Pagefault {
-                                address,
-                                registers_modified: false,
-                            });
-
-                            debug_assert!(address <= u64::from(u32::MAX));
-
-                            linux_raw::sys_ptrace_interrupt(self.child.pid)?;
-                            let status = self.child.check_status(false)?;
-                            if !status.is_trapped() {
-                                log::error!("Child #{}: expected child to trap, found: {status}", self.child.pid);
-                                return Err(Error::from_str("internal error: unexpected child status"));
-                            }
-
-                            let machine_code_address = self.download_registers()?;
-                            log::trace!("Child #{}: pagefault: rip=0x{machine_code_address:x}", self.child.pid);
-
-                            let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
-                            let Some(machine_code_offset) = machine_code_address.checked_sub(compiled_module.native_code_origin) else {
-                                return Err(Error::from_str("internal error: address underflow after a segfault"));
-                            };
-
-                            match compiled_module.bitness {
-                                Bitness::B32 => crate::compiler::ArchVisitor::<Self, B32>::on_page_fault(
-                                    compiled_module,
-                                    self.gas_metering.is_some(),
-                                    machine_code_address,
-                                    machine_code_offset,
-                                    self.vmctx(),
-                                ),
-                                Bitness::B64 => crate::compiler::ArchVisitor::<Self, B64>::on_page_fault(
-                                    compiled_module,
-                                    self.gas_metering.is_some(),
-                                    machine_code_address,
-                                    machine_code_offset,
-                                    self.vmctx(),
-                                ),
-                            }
-                            .map_err(Error::from_str)?;
-
-                            self.is_program_counter_valid = true;
-                            return Ok(Interrupt::Segfault(Segfault {
-                                page_address: address as u32,
-                                page_size: get_native_page_size() as u32,
-                            }));
-                        }
-                    } else if job.user_data == IO_URING_JOB_TIMEOUT {
-                        self.iouring_timeout_queued = false;
-
-                        log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
-                        self.check_child_status()?;
-                    } else {
-                        unreachable!("internal error: unknown io_uring job");
-                    }
-                }
+            let spin_target = if self.module.as_ref().map_or(false, |module| module.is_step_tracing()) {
+                128
             } else {
-                let spin_target = if self.module.as_ref().map_or(false, |module| module.is_step_tracing()) {
-                    128
-                } else {
-                    0
-                };
+                0
+            };
 
-                let yield_target = 16;
+            let yield_target = 16;
 
-                for _ in 0..spin_target {
-                    core::hint::spin_loop();
-                    if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
-                        continue 'outer;
+            for _ in 0..spin_target {
+                core::hint::spin_loop();
+                if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
+                    continue 'outer;
+                }
+            }
+
+            for _ in 0..yield_target {
+                let _ = linux_raw::sys_sched_yield();
+                if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
+                    continue 'outer;
+                }
+            }
+
+            self.count_futex_wait += 1;
+            match linux_raw::sys_futex_wait(&self.vmctx().futex, VMCTX_FUTEX_BUSY, Some(Duration::from_millis(100))) {
+                Ok(()) => continue,
+                Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
+                Err(error) if error.errno() == linux_raw::ETIMEDOUT => {
+                    log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
+                    let status = self.child.check_status(true)?;
+                    if let Some(interrupt) = self.handle_child_status(status)? {
+                        return Ok(interrupt);
                     }
                 }
-
-                for _ in 0..yield_target {
-                    let _ = linux_raw::sys_sched_yield();
-                    if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
-                        continue 'outer;
-                    }
-                }
-
-                self.count_futex_wait += 1;
-                match linux_raw::sys_futex_wait(&self.vmctx().futex, VMCTX_FUTEX_BUSY, Some(Duration::from_millis(100))) {
-                    Ok(()) => continue,
-                    Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
-                    Err(error) if error.errno() == linux_raw::ETIMEDOUT => {
-                        log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
-                        self.check_child_status()?;
-                    }
-                    Err(error) => return Err(error),
-                }
+                Err(error) => return Err(error),
             }
         }
     }
 
-    fn check_child_status(&mut self) -> Result<(), Error> {
-        let status = self.child.check_status(true)?;
+    fn handle_child_status(&mut self, status: ChildStatus) -> Result<Option<Interrupt>, Error> {
+        self.is_borked = true;
+
         if status.is_running() {
-            return Ok(());
+            self.is_borked = false;
+            return Ok(None);
         }
 
         log::trace!("Child #{} is not running anymore: {status}", self.child.pid);
@@ -2485,79 +2423,5 @@ impl Sandbox {
         } else {
             Err(Error::from(format!("worker process unexpectedly quit: {status}")))
         }
-    }
-
-    #[inline]
-    fn get_register(reg: polkavm_common::regmap::NativeReg, regs: &mut linux_raw::user_regs_struct) -> &mut u64 {
-        use polkavm_common::regmap::NativeReg::*;
-
-        match reg {
-            rax => &mut regs.rax,
-            rcx => &mut regs.rcx,
-            rdx => &mut regs.rdx,
-            rbx => &mut regs.rbx,
-            rbp => &mut regs.rbp,
-            rsi => &mut regs.rsi,
-            rdi => &mut regs.rdi,
-            r8 => &mut regs.r8,
-            r9 => &mut regs.r9,
-            r10 => &mut regs.r10,
-            r11 => &mut regs.r11,
-            r12 => &mut regs.r12,
-            r13 => &mut regs.r13,
-            r14 => &mut regs.r14,
-            r15 => &mut regs.r15,
-        }
-    }
-
-    fn download_registers(&mut self) -> Result<u64, Error> {
-        use crate::sandbox::Sandbox;
-
-        let mut regs = linux_raw::sys_ptrace_getregs(self.child.pid)?;
-        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
-        for reg in Reg::ALL {
-            let mut value = *Self::get_register(polkavm_common::regmap::to_native_reg(reg), &mut regs);
-            if compiled_module.bitness == Bitness::B32 {
-                value &= 0xffffffff;
-            }
-
-            self.vmctx().regs[reg as usize].store(value, Ordering::Relaxed);
-        }
-
-        self.vmctx()
-            .tmp_reg
-            .store(*Self::get_register(polkavm_common::regmap::TMP_REG, &mut regs), Ordering::Relaxed);
-
-        Ok(regs.rip)
-    }
-
-    fn upload_registers(&mut self) -> Result<(), Error> {
-        let mut regs = linux_raw::sys_ptrace_getregs(self.child.pid)?;
-        for reg in Reg::ALL {
-            *Self::get_register(polkavm_common::regmap::to_native_reg(reg), &mut regs) =
-                self.vmctx().regs[reg as usize].load(Ordering::Relaxed);
-        }
-
-        regs.rip = self.vmctx().next_native_program_counter.load(Ordering::Relaxed);
-        *Self::get_register(polkavm_common::regmap::TMP_REG, &mut regs) = self.vmctx().tmp_reg.load(Ordering::Relaxed);
-
-        linux_raw::sys_ptrace_setregs(self.child.pid, &regs)?;
-
-        Ok(())
-    }
-
-    fn cancel_pagefault(&mut self) -> Result<(), Error> {
-        log::trace!("Cancelling pending page fault...");
-
-        // This will cancel *our own* `futex_wait` which we've queued up with iouring.
-        linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-
-        // Forcibly return the worker to the idle state.
-        //
-        // The worker's currently stuck in a page fault somewhere inside guest code,
-        // so it can't do this by itself.
-        self.vmctx().futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
-        linux_raw::sys_ptrace_setregs(self.child.pid, &self.idle_regs)?;
-        linux_raw::sys_ptrace_continue(self.child.pid, None)
     }
 }

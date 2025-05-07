@@ -12,8 +12,8 @@ use polkavm_common::zygote::VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH;
 use crate::error::Error;
 
 use crate::api::RuntimeInstructionSet;
-use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
-use crate::gas::GasVisitor;
+use crate::config::{CustomCodegen, GasMeteringKind, ModuleConfig, SandboxKind};
+use crate::gas::{CostModelRef, GasVisitor};
 use crate::mutex::Mutex;
 use crate::sandbox::{Sandbox, SandboxInit, SandboxProgram};
 use crate::utils::{FlatMap, GuestInit};
@@ -116,6 +116,7 @@ where
     instruction_set: RuntimeInstructionSet,
     memset_trampoline_start: usize,
     memset_trampoline_end: usize,
+    custom_codegen: Option<Arc<dyn CustomCodegen>>,
 
     _phantom: PhantomData<(S, B)>,
 }
@@ -164,6 +165,7 @@ where
         step_tracing: bool,
         code_length: u32,
         init: GuestInit<'a>,
+        cost_model: CostModelRef,
     ) -> Result<(Self, S::AddressSpace), Error>
     where
         S: Sandbox,
@@ -233,7 +235,7 @@ where
         asm.set_origin(native_code_origin);
 
         let mut visitor = CompilerVisitor {
-            gas_visitor: GasVisitor::default(),
+            gas_visitor: GasVisitor::new(cost_model),
             asm,
             exports,
             program_counter_to_label,
@@ -259,6 +261,7 @@ where
             instruction_set,
             memset_trampoline_start: 0,
             memset_trampoline_end: 0,
+            custom_codegen: config.custom_codegen.clone(),
             _phantom: PhantomData,
         };
 
@@ -454,7 +457,7 @@ where
     fn after_instruction<const KIND: usize>(&mut self, program_counter: u32, args_length: u32) {
         assert!(KIND == CONTINUE_BASIC_BLOCK || KIND == END_BASIC_BLOCK || KIND == END_BASIC_BLOCK_INVALID);
 
-        if cfg!(debug_assertions) && !self.step_tracing {
+        if cfg!(debug_assertions) && !self.step_tracing && self.custom_codegen.is_none() {
             let offset = self.program_counter_to_machine_code_offset_list.last().unwrap().1 as usize;
             let instruction_length = self.asm.len() - offset;
             if instruction_length > VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH as usize {
@@ -488,18 +491,27 @@ where
 
     #[cold]
     fn current_instruction(&self, program_counter: u32) -> impl core::fmt::Display {
-        struct MaybeInstruction(Option<ParsedInstruction>);
-        impl core::fmt::Display for MaybeInstruction {
+        struct MaybeInstruction<B>(Option<ParsedInstruction>, PhantomData<B>);
+        impl<B> core::fmt::Display for MaybeInstruction<B>
+        where
+            B: CompilerBitness,
+        {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                 if let Some(instruction) = self.0 {
-                    instruction.fmt(fmt)
+                    let mut format = polkavm_common::program::InstructionFormat::default();
+                    format.is_64_bit = matches!(B::BITNESS, Bitness::B64);
+                    instruction.display(&format).fmt(fmt)?;
+                    Ok(())
                 } else {
                     write!(fmt, "<NONE>")
                 }
             }
         }
 
-        MaybeInstruction(Instructions::new_bounded(self.instruction_set, self.code, self.bitmask, program_counter).next())
+        MaybeInstruction::<B>(
+            Instructions::new_bounded(self.instruction_set, self.code, self.bitmask, program_counter).next(),
+            PhantomData,
+        )
     }
 
     #[cold]
@@ -1204,34 +1216,34 @@ where
     }
 
     #[inline(always)]
-    fn rotate_right_32_imm(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
+    fn rotate_right_imm_32(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
         self.before_instruction(code_offset);
-        self.gas_visitor.rotate_right_32_imm(d, s, c);
-        ArchVisitor(self).rotate_right_32_imm(d, s, c);
+        self.gas_visitor.rotate_right_imm_32(d, s, c);
+        ArchVisitor(self).rotate_right_imm_32(d, s, c);
         self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn rotate_right_32_imm_alt(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
+    fn rotate_right_imm_alt_32(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
         self.before_instruction(code_offset);
-        self.gas_visitor.rotate_right_32_imm_alt(d, s, c);
-        ArchVisitor(self).rotate_right_32_imm_alt(d, s, c);
+        self.gas_visitor.rotate_right_imm_alt_32(d, s, c);
+        ArchVisitor(self).rotate_right_imm_alt_32(d, s, c);
         self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn rotate_right_64_imm(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
+    fn rotate_right_imm_64(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
         self.before_instruction(code_offset);
-        self.gas_visitor.rotate_right_64_imm(d, s, c);
-        ArchVisitor(self).rotate_right_64_imm(d, s, c);
+        self.gas_visitor.rotate_right_imm_64(d, s, c);
+        ArchVisitor(self).rotate_right_imm_64(d, s, c);
         self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn rotate_right_64_imm_alt(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
+    fn rotate_right_imm_alt_64(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg, c: u32) -> Self::ReturnTy {
         self.before_instruction(code_offset);
-        self.gas_visitor.rotate_right_64_imm_alt(d, s, c);
-        ArchVisitor(self).rotate_right_64_imm_alt(d, s, c);
+        self.gas_visitor.rotate_right_imm_alt_64(d, s, c);
+        ArchVisitor(self).rotate_right_imm_alt_64(d, s, c);
         self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 

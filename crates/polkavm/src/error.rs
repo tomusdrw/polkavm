@@ -1,4 +1,3 @@
-use alloc::format;
 use alloc::string::{String, ToString};
 use polkavm_common::program::ProgramParseError;
 
@@ -69,15 +68,21 @@ impl Error {
     pub(crate) fn from_static_str(message: &'static str) -> Self {
         Error(ErrorKind::Static(message))
     }
+}
 
-    #[cold]
-    pub(crate) fn context(self, message: impl core::fmt::Display) -> Self {
-        let string = match self.0 {
-            ErrorKind::Owned(buffer) => format!("{}: {}", message, buffer),
-            error => format!("{}: {}", message, Error(error)),
-        };
+if_compiler_is_supported! {
+    impl Error {
+        #[cold]
+        pub(crate) fn context(self, message: impl core::fmt::Display) -> Self {
+            use alloc::format;
 
-        Error(ErrorKind::Owned(string))
+            let string = match self.0 {
+                ErrorKind::Owned(buffer) => format!("{}: {}", message, buffer),
+                error => format!("{}: {}", message, Error(error)),
+            };
+
+            Error(ErrorKind::Owned(string))
+        }
     }
 }
 
@@ -95,3 +100,9 @@ impl core::fmt::Display for Error {
 
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
+
+impl From<Error> for String {
+    fn from(error: Error) -> String {
+        error.to_string()
+    }
+}
