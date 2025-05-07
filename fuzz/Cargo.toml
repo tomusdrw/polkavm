@@ -15,6 +15,12 @@ libfuzzer-sys = "0.4"
 path = "../crates/polkavm"
 features = ["export-internals-for-testing"]
 
+[dependencies.polkavm-linker]
+path = "../crates/polkavm-linker"
+
+[dependencies.polkavm-common]
+path = "../crates/polkavm-common"
+
 [[bin]]
 name = "fuzz_shm_allocator"
 path = "fuzz_targets/fuzz_shm_allocator.rs"
@@ -25,6 +31,20 @@ bench = false
 [[bin]]
 name = "fuzz_generic_allocator"
 path = "fuzz_targets/fuzz_generic_allocator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_linker"
+path = "fuzz_targets/fuzz_linker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_polkavm"
+path = "fuzz_targets/fuzz_polkavm.rs"
 test = false
 doc = false
 bench = false

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dwarf::Location;
 use crate::elf::{Elf, Section, SectionIndex};
+use crate::fast_range_map::RangeMap;
 use crate::riscv::DecoderConfig;
 use crate::riscv::Reg as RReg;
 use crate::riscv::{AtomicKind, BranchKind, CmovKind, Inst, LoadKind, RegImmKind, StoreKind};
@@ -324,6 +325,29 @@ impl SourceStack {
     fn overlay_on_top_of_inplace(&mut self, stack: &SourceStack) {
         self.0.extend(stack.0.iter().copied());
     }
+
+    fn display(&self, section_to_function_name: &BTreeMap<SectionTarget, &str>) -> String {
+        use core::fmt::Write;
+
+        let mut out = String::new();
+        out.push('[');
+        let mut is_first = true;
+        for source in &self.0 {
+            if is_first {
+                is_first = false;
+            } else {
+                out.push_str(", ");
+            }
+            write!(&mut out, "{}", source).unwrap();
+            if let Some((origin, name)) = section_to_function_name.range(..=source.begin()).next_back() {
+                if origin.section_index == source.section_index {
+                    write!(&mut out, " \"{name}\"+{}", source.offset_range.start - origin.offset).unwrap();
+                }
+            }
+        }
+        out.push(']');
+        out
+    }
 }
 
 impl From<Source> for SourceStack {
@@ -625,6 +649,9 @@ enum BasicInst<T> {
     },
     Memset,
     Nop,
+    LoadHeapBase {
+        dst: Reg,
+    },
 }
 
 #[derive(Copy, Clone)]
@@ -646,6 +673,7 @@ impl<T> BasicInst<T> {
     fn src_mask(&self, imports: &[Import]) -> RegMask {
         match *self {
             BasicInst::Nop
+            | BasicInst::LoadHeapBase { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadImmediate64 { .. }
             | BasicInst::LoadAbsolute { .. }
@@ -668,6 +696,7 @@ impl<T> BasicInst<T> {
         match *self {
             BasicInst::Nop | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => RegMask::empty(),
             BasicInst::MoveReg { dst, .. }
+            | BasicInst::LoadHeapBase { dst }
             | BasicInst::LoadImmediate { dst, .. }
             | BasicInst::LoadImmediate64 { dst, .. }
             | BasicInst::LoadAbsolute { dst, .. }
@@ -693,6 +722,7 @@ impl<T> BasicInst<T> {
             | BasicInst::Memset { .. } => true,
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
             BasicInst::Nop
+            | BasicInst::LoadHeapBase { .. }
             | BasicInst::MoveReg { .. }
             | BasicInst::Reg { .. }
             | BasicInst::LoadImmediate { .. }
@@ -784,6 +814,9 @@ impl<T> BasicInst<T> {
                 assert_eq!(map(Reg::A2, OpKind::ReadWrite), Reg::A2);
                 Some(BasicInst::Memset)
             }
+            BasicInst::LoadHeapBase { dst } => Some(BasicInst::LoadHeapBase {
+                dst: map(dst, OpKind::Write),
+            }),
             BasicInst::Nop => Some(BasicInst::Nop),
         }
     }
@@ -852,6 +885,7 @@ impl<T> BasicInst<T> {
             BasicInst::Cmov { kind, dst, src, cond } => BasicInst::Cmov { kind, dst, src, cond },
             BasicInst::Ecalli { nth_import } => BasicInst::Ecalli { nth_import },
             BasicInst::Sbrk { dst, size } => BasicInst::Sbrk { dst, size },
+            BasicInst::LoadHeapBase { dst } => BasicInst::LoadHeapBase { dst },
             BasicInst::Memset => BasicInst::Memset,
             BasicInst::Nop => BasicInst::Nop,
         })
@@ -865,6 +899,7 @@ impl<T> BasicInst<T> {
             BasicInst::LoadAbsolute { target, .. } | BasicInst::StoreAbsolute { target, .. } => (Some(*target), None),
             BasicInst::LoadAddress { target, .. } | BasicInst::LoadAddressIndirect { target, .. } => (None, Some(*target)),
             BasicInst::Nop
+            | BasicInst::LoadHeapBase { .. }
             | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadImmediate64 { .. }
@@ -1119,6 +1154,7 @@ struct MemoryConfig {
     ro_data_size: u32,
     rw_data_size: u32,
     min_stack_size: u32,
+    heap_base: u32,
 }
 
 fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
@@ -1198,6 +1234,7 @@ fn extract_memory_config<H>(
     sections_bss: &[SectionIndex],
     sections_min_stack_size: &[SectionIndex],
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
+    mut min_stack_size: u32,
 ) -> Result<MemoryConfig, ProgramFromElfError>
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
@@ -1223,7 +1260,6 @@ where
         sections_rw_data.iter().copied().chain(sections_bss.iter().copied()),
     );
 
-    let mut min_stack_size = VM_MIN_PAGE_SIZE * 2;
     for &section_index in sections_min_stack_size {
         let section = elf.section_by_index(section_index);
         let data = section.data();
@@ -1246,7 +1282,7 @@ where
     let rw_data_size = u32::try_from(rw_data_size).expect("overflow");
 
     // Sanity check that the memory configuration is actually valid.
-    {
+    let heap_base = {
         let rw_data_size_physical: u64 = rw_data.iter().map(|x| x.size() as u64).sum();
         let rw_data_size_physical = u32::try_from(rw_data_size_physical).expect("overflow");
         assert!(rw_data_size_physical <= rw_data_size);
@@ -1265,7 +1301,9 @@ where
 
         assert_eq!(u64::from(config.ro_data_address()), ro_data_address);
         assert_eq!(u64::from(config.rw_data_address()), rw_data_address);
-    }
+
+        config.heap_base()
+    };
 
     let memory_config = MemoryConfig {
         ro_data,
@@ -1273,6 +1311,7 @@ where
         ro_data_size,
         rw_data_size,
         min_stack_size,
+        heap_base,
     };
 
     Ok(memory_config)
@@ -1319,15 +1358,12 @@ where
             };
 
             // Ignore the address as written; we'll just use the relocations instead.
-            let error = if elf.is_64() { b.read_u64().err() } else { b.read_u32().err() };
-
-            if let Some(error) = error {
-                return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
-            }
+            let address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
+            let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
             let Some(relocation) = relocations.get(&location) else {
                 return Err(ProgramFromElfError::other(format!(
-                    "found an export without a relocation for a pointer to the metadata at {location}"
+                    "found an export without a relocation for a pointer to the metadata at {location} (found address = 0x{address:x})"
                 )));
             };
 
@@ -1994,8 +2030,17 @@ where
             Ok(())
         }
         Inst::Load { kind, dst, base, offset } => {
+            if dst == RReg::Zero && base == RReg::Zero && offset == 0 {
+                // These are sometimes used as a poor man's trap.
+                emit(InstExt::Control(ControlInst::Unimplemented));
+                return Ok(());
+            }
+
             let Some(base) = cast_reg_non_zero(base)? else {
-                return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
+                return Err(ProgramFromElfError::other(format!(
+                    "found an unrelocated absolute load at {}",
+                    current_location.fmt_human_readable(elf)
+                )));
             };
 
             // LLVM riscv-enable-dead-defs pass may rewrite dst to the zero register.
@@ -2007,8 +2052,16 @@ where
             Ok(())
         }
         Inst::Store { kind, src, base, offset } => {
+            if src == RReg::Zero && base == RReg::Zero && offset == 0 {
+                emit(InstExt::Control(ControlInst::Unimplemented));
+                return Ok(());
+            }
+
             let Some(base) = cast_reg_non_zero(base)? else {
-                return Err(ProgramFromElfError::other("found an unrelocated absolute store"));
+                return Err(ProgramFromElfError::other(format!(
+                    "found an unrelocated absolute store at {}",
+                    current_location.fmt_human_readable(elf)
+                )));
             };
 
             let src = cast_reg_any(src)?;
@@ -2082,11 +2135,21 @@ where
                 return Ok(());
             };
 
-            let Some(src) = cast_reg_non_zero(src)? else {
-                return Err(ProgramFromElfError::other("found an invalid instruction"));
-            };
-
             use crate::riscv::RegKind as K;
+
+            let Some(src) = cast_reg_non_zero(src)? else {
+                let imm = match kind {
+                    K::CountLeadingZeroBits32 | K::CountTrailingZeroBits32 => 32,
+                    K::CountLeadingZeroBits64 | K::CountTrailingZeroBits64 => 64,
+                    K::CountSetBits32 | K::CountSetBits64 => 0,
+                    K::ReverseByte => 0,
+                    K::OrCombineByte => 0,
+                    K::SignExtend8 | K::SignExtend16 | K::ZeroExtend16 => 0,
+                };
+
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm }));
+                return Ok(());
+            };
 
             let kind = match kind {
                 K::CountLeadingZeroBits32 => RegKind::CountLeadingZeroBits32,
@@ -2597,6 +2660,11 @@ fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
     }
 }
 
+const FUNC3_ECALLI: u32 = 0b000;
+const FUNC3_SBRK: u32 = 0b001;
+const FUNC3_MEMSET: u32 = 0b010;
+const FUNC3_HEAP_BASE: u32 = 0b011;
+
 #[allow(clippy::too_many_arguments)]
 fn parse_code_section<H>(
     elf: &Elf<H>,
@@ -2631,16 +2699,12 @@ where
 
         let (inst_size, raw_inst) = read_instruction_bytes(text, relative_offset);
 
-        const FUNC3_ECALLI: u32 = 0b000;
-        const FUNC3_SBRK: u32 = 0b001;
-        const FUNC3_MEMSET: u32 = 0b010;
-
         if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
             let pointer_size = if elf.is_64() { 8 } else { 4 };
 
-            // `ret` can be 2 bytes long, so (on 32-bit): 4 (ecalli) + 4 (pointer) + 2 (ret) = 10
-            if relative_offset + pointer_size + 6 > text.len() {
+            // so (on 32-bit): 4 (ecalli) + 4 (pointer) = 8
+            if relative_offset + pointer_size + 4 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
@@ -2692,27 +2756,6 @@ where
                 InstExt::Basic(BasicInst::Ecalli { nth_import }),
             ));
 
-            const INST_RET: Inst = Inst::JumpAndLinkRegister {
-                dst: RReg::Zero,
-                base: RReg::RA,
-                value: 0,
-            };
-
-            let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
-
-            if Inst::decode(decoder_config, next_raw_inst) != Some(INST_RET) {
-                return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
-            }
-
-            output.push((
-                Source {
-                    section_index,
-                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + next_inst_size),
-                },
-                InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
-            ));
-
-            relative_offset += next_inst_size as usize;
             continue;
         }
 
@@ -2748,6 +2791,22 @@ where
                     offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
                 },
                 InstExt::Basic(BasicInst::Memset),
+            ));
+
+            relative_offset += inst_size as usize;
+            continue;
+        }
+
+        if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_HEAP_BASE, 0, dst, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
+            output.push((
+                Source {
+                    section_index,
+                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
+                },
+                match cast_reg_non_zero(dst)? {
+                    Some(dst) => InstExt::Basic(BasicInst::LoadHeapBase { dst }),
+                    None => InstExt::Basic(BasicInst::Nop),
+                },
             ));
 
             relative_offset += inst_size as usize;
@@ -2831,6 +2890,7 @@ where
 
 fn split_code_into_basic_blocks<H>(
     elf: &Elf<H>,
+    #[allow(unused_variables)] section_to_function_name: &BTreeMap<SectionTarget, &str>,
     jump_targets: &HashSet<SectionTarget>,
     instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
 ) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError>
@@ -2844,13 +2904,20 @@ where
     let mut current_block: Vec<(SourceStack, BasicInst<SectionTarget>)> = Vec::new();
     let mut block_start_opt = None;
     let mut last_source_in_block = None;
+    #[cfg(not(test))]
+    let mut current_symbol = "";
     for (source, op) in instructions {
         // TODO: This panics because we use a dummy ELF in tests; fix it.
         #[cfg(not(test))]
-        log::trace!(
-            "Instruction at {source} (0x{:x}): {op:?}",
-            elf.section_by_index(source.section_index).original_address() + source.offset_range.start
-        );
+        {
+            if let Some(name) = section_to_function_name.get(&source.begin()) {
+                current_symbol = name;
+            }
+            log::trace!(
+                "Instruction at {source} (0x{:x}) \"{current_symbol}\": {op:?}",
+                elf.section_by_index(source.section_index).original_address() + source.offset_range.start
+            );
+        }
 
         if let Some(last_source_in_block) = last_source_in_block {
             // Handle the case where we've emitted multiple instructions from a single RISC-V instruction.
@@ -4315,11 +4382,19 @@ impl OperationKind {
             (O::ShiftArithmeticRight32, lhs, C(0)) => lhs,
             (O::ShiftArithmeticRight64, lhs, C(0)) => lhs,
             // x % 0 = x
-            (O::Rem32,                  lhs, C(0)) => lhs,
-            (O::Rem64,                  lhs, C(0)) => lhs,
-            // x % 0 = x
-            (O::RemUnsigned32,          lhs, C(0)) => lhs,
-            (O::RemUnsigned64,          lhs, C(0)) => lhs,
+            (O::Rem32,                          lhs, C(0)) => lhs,
+            (O::Rem64,                          lhs, C(0)) => lhs,
+            (O::RemUnsigned32,                  lhs, C(0)) => lhs,
+            (O::RemUnsigned64,                  lhs, C(0)) => lhs,
+            (O::Rem32AndSignExtend,             lhs, C(0)) => lhs,
+            (O::RemUnsigned32AndSignExtend,     lhs, C(0)) => lhs,
+            // 0 % x = 0
+            (O::Rem32,                          C(0), _) => C(0),
+            (O::Rem64,                          C(0), _) => C(0),
+            (O::RemUnsigned32,                  C(0), _) => C(0),
+            (O::RemUnsigned64,                  C(0), _) => C(0),
+            (O::Rem32AndSignExtend,             C(0), _) => C(0),
+            (O::RemUnsigned32AndSignExtend,     C(0), _) => C(0),
 
             // x & 0 = 0
             (O::And32,                    _, C(0)) => C(0),
@@ -4347,10 +4422,20 @@ impl OperationKind {
             (O::MulUpperUnsignedUnsigned64, C(0), _) => C(0),
 
             // x / 0 = -1
-            (O::Div32,                    _, C(0)) => C(-1),
-            (O::Div64,                    _, C(0)) => C(-1),
-            (O::DivUnsigned32,            _, C(0)) => C(-1),
-            (O::DivUnsigned64,            _, C(0)) => C(-1),
+            (O::Div32,                          _, C(0)) => C(-1),
+            (O::Div64,                          _, C(0)) => C(-1),
+            (O::DivUnsigned32,                  _, C(0)) => C(-1),
+            (O::DivUnsigned64,                  _, C(0)) => C(-1),
+            (O::Div32AndSignExtend,             _, C(0)) => C(-1),
+            (O::DivUnsigned32AndSignExtend,     _, C(0)) => C(-1),
+
+            // 0 / x = 0
+            (O::Div32,                          C(0), _) => C(0),
+            (O::Div64,                          C(0), _) => C(0),
+            (O::DivUnsigned32,                  C(0), _) => C(0),
+            (O::DivUnsigned64,                  C(0), _) => C(0),
+            (O::Div32AndSignExtend,             C(0), _) => C(0),
+            (O::DivUnsigned32AndSignExtend,     C(0), _) => C(0),
 
             // (x & ~0) = x
             (O::AndInverted,              lhs, C(0)) => lhs,
@@ -5594,17 +5679,17 @@ mod test {
             )
             .unwrap();
 
-            let all_blocks = split_code_into_basic_blocks(&elf, &all_jump_targets, self.instructions.clone()).unwrap();
+            let all_blocks = split_code_into_basic_blocks(&elf, &Default::default(), &all_jump_targets, self.instructions.clone()).unwrap();
             let mut section_to_block = build_section_to_block_map(&all_blocks).unwrap();
             let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks).unwrap();
             let mut reachability_graph =
                 calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
-            if config.optimize {
+            if matches!(config.opt_level, OptLevel::O2) {
                 optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
             }
             let mut used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
 
-            if config.optimize {
+            if matches!(config.opt_level, OptLevel::O2) {
                 used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
                 merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
                 replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
@@ -5622,6 +5707,7 @@ mod test {
 
             let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
             let code = emit_code(
+                &Default::default(),
                 &imports,
                 &base_address_for_section,
                 section_got,
@@ -5632,6 +5718,7 @@ mod test {
                 &jump_target_for_block,
                 true,
                 false,
+                0,
             )
             .unwrap();
 
@@ -5688,11 +5775,11 @@ mod test {
             expected_disassembly: &str,
         ) {
             let mut unopt = self.build(Config {
-                optimize: false,
+                opt_level: OptLevel::O0,
                 ..Config::default()
             });
             let mut opt = self.build(Config {
-                optimize: true,
+                opt_level: OptLevel::O2,
                 ..Config::default()
             });
 
@@ -7126,6 +7213,7 @@ fn calculate_whether_can_fallthrough(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_code(
+    section_to_function_name: &BTreeMap<SectionTarget, &str>,
     imports: &[Import],
     base_address_for_section: &HashMap<SectionIndex, u64>,
     section_got: SectionIndex,
@@ -7136,6 +7224,7 @@ fn emit_code(
     jump_target_for_block: &[Option<JumpTarget>],
     is_optimized: bool,
     is_rv64: bool,
+    heap_base: u32,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
     use polkavm_common::program::Reg as PReg;
     fn conv_reg(reg: Reg) -> polkavm_common::program::RawReg {
@@ -7161,10 +7250,13 @@ fn emit_code(
     }
 
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);
-    let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
-        if let Some(base_address) = base_address_for_section.get(&target.section_index) {
+    let get_data_address = |source: &SourceStack, target: SectionTarget| -> Result<u32, ProgramFromElfError> {
+        if let Some(&base_address) = base_address_for_section.get(&target.section_index) {
             let Some(address) = base_address.checked_add(target.offset) else {
-                return Err(ProgramFromElfError::other("address overflow when relocating"));
+                return Err(ProgramFromElfError::other(format!(
+                    "address overflow when relocating instruction in {}",
+                    source.display(section_to_function_name)
+                )));
             };
 
             let Ok(address) = address.try_into() else {
@@ -7229,9 +7321,10 @@ fn emit_code(
                         Instruction::load_imm64(conv_reg(dst), cast(imm).to_unsigned())
                     }
                 }
+                BasicInst::LoadHeapBase { dst } => Instruction::load_imm(conv_reg(dst), heap_base),
                 BasicInst::LoadAbsolute { kind, dst, target } => {
                     codegen! {
-                        args = (conv_reg(dst), get_data_address(target)?),
+                        args = (conv_reg(dst), get_data_address(source, target)?),
                         kind = kind,
                         {
                             LoadKind::I8 => load_i8,
@@ -7245,7 +7338,7 @@ fn emit_code(
                     }
                 }
                 BasicInst::StoreAbsolute { kind, src, target } => {
-                    let target = get_data_address(target)?;
+                    let target = get_data_address(source, target)?;
                     match src {
                         RegImm::Reg(src) => {
                             codegen! {
@@ -7323,7 +7416,7 @@ fn emit_code(
                             };
                             value
                         }
-                        AnyTarget::Data(target) => get_data_address(target)?,
+                        AnyTarget::Data(target) => get_data_address(source, target)?,
                     };
 
                     Instruction::load_imm(conv_reg(dst), value)
@@ -7340,7 +7433,7 @@ fn emit_code(
                         offset,
                     };
 
-                    let value = get_data_address(target)?;
+                    let value = get_data_address(source, target)?;
                     if is_rv64 {
                         Instruction::load_u64(conv_reg(dst), value)
                     } else {
@@ -7476,9 +7569,9 @@ fn emit_code(
                                 K::Mul32 => I::mul_imm_32(dst, src1, src2),
                                 K::Mul32AndSignExtend => I::mul_imm_32(dst, src1, src2),
                                 K::Mul64 => I::mul_imm_64(dst, src1, src2),
-                                K::RotateRight32 => I::rotate_right_32_imm(dst, src1, src2),
-                                K::RotateRight32AndSignExtend => I::rotate_right_32_imm(dst, src1, src2),
-                                K::RotateRight64 => I::rotate_right_64_imm(dst, src1, src2),
+                                K::RotateRight32 => I::rotate_right_imm_32(dst, src1, src2),
+                                K::RotateRight32AndSignExtend => I::rotate_right_imm_32(dst, src1, src2),
+                                K::RotateRight64 => I::rotate_right_imm_64(dst, src1, src2),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Reg(src2)) => {
@@ -7512,9 +7605,9 @@ fn emit_code(
                                 K::ShiftArithmeticRight32AndSignExtend => I::shift_arithmetic_right_imm_alt_32(dst, src2, src1),
                                 K::ShiftArithmeticRight64 => I::shift_arithmetic_right_imm_alt_64(dst, src2, src1),
 
-                                K::RotateRight32 => I::rotate_right_32_imm_alt(dst, src2, src1),
-                                K::RotateRight32AndSignExtend => I::rotate_right_32_imm_alt(dst, src2, src1),
-                                K::RotateRight64 => I::rotate_right_64_imm_alt(dst, src2, src1),
+                                K::RotateRight32 => I::rotate_right_imm_alt_32(dst, src2, src1),
+                                K::RotateRight32AndSignExtend => I::rotate_right_imm_alt_32(dst, src2, src1),
+                                K::RotateRight64 => I::rotate_right_imm_alt_64(dst, src2, src1),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
@@ -7841,7 +7934,7 @@ where
     let mut for_address = BTreeMap::new();
     for (absolute_address, relocation) in section.relocations() {
         let Some(relative_address) = absolute_address.checked_sub(section.original_address()) else {
-            return Err(ProgramFromElfError::other("invalid relocation offset"));
+            return Err(ProgramFromElfError::other("invalid data relocation offset"));
         };
 
         if relocation.has_implicit_addend() {
@@ -7852,6 +7945,26 @@ where
         let Some(target) = get_relocation_target(elf, &relocation)? else {
             continue;
         };
+
+        if relocation.flags()
+            == (object::RelocationFlags::Elf {
+                r_type: object::elf::R_RISCV_PCREL_HI20,
+            })
+            && section_name == ".polkavm_exports"
+        {
+            relocations.insert(
+                SectionTarget {
+                    section_index: section.index(),
+                    offset: relative_address,
+                },
+                RelocationKind::Abs {
+                    target,
+                    size: if elf.is_64() { RelocationSize::U64 } else { RelocationSize::U32 },
+                },
+            );
+
+            continue;
+        }
 
         let (relocation_name, kind) = match (relocation.kind(), relocation.flags()) {
             (object::RelocationKind::Absolute, _)
@@ -8165,7 +8278,7 @@ where
     let section_data = section.data();
     for (absolute_address, relocation) in section.relocations() {
         let Some(relative_address) = absolute_address.checked_sub(section.original_address()) else {
-            return Err(ProgramFromElfError::other("invalid relocation offset"));
+            return Err(ProgramFromElfError::other("invalid code relocation offset"));
         };
 
         if relocation.has_implicit_addend() {
@@ -8268,6 +8381,25 @@ where
                         );
                     }
                     object::elf::R_RISCV_PCREL_HI20 => {
+                        if let Some(raw_inst) = section_data
+                            .get((relative_address as usize).wrapping_sub(4)..)
+                            .and_then(|slice| slice.get(..4))
+                        {
+                            let raw_inst = u32::from_le_bytes([raw_inst[0], raw_inst[1], raw_inst[2], raw_inst[3]]);
+                            if crate::riscv::R(raw_inst).unpack()
+                                == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero)
+                            {
+                                data_relocations.insert(
+                                    current_location,
+                                    RelocationKind::Abs {
+                                        target,
+                                        size: if elf.is_64() { RelocationSize::U64 } else { RelocationSize::U32 },
+                                    },
+                                );
+                                continue;
+                            }
+                        }
+
                         // This relocation is for an AUIPC.
                         pcrel_relocations
                             .reloc_pcrel_hi20
@@ -8419,11 +8551,23 @@ where
                                 src: _,
                                 imm: _,
                             } => {
-                                let Some(dst) = cast_reg_non_zero(dst)? else {
-                                    return Err(ProgramFromElfError::other("R_RISCV_LO12_I with a zero destination register"));
-                                };
-
-                                InstExt::Basic(BasicInst::LoadAddress { dst, target })
+                                if let Some(dst) = cast_reg_non_zero(dst)? {
+                                    InstExt::Basic(BasicInst::LoadAddress { dst, target })
+                                } else {
+                                    InstExt::nop()
+                                }
+                            }
+                            Inst::RegImm {
+                                kind: RegImmKind::Add64,
+                                dst,
+                                src: _,
+                                imm: _,
+                            } => {
+                                if let Some(dst) = cast_reg_non_zero(dst)? {
+                                    InstExt::Basic(BasicInst::LoadAddress { dst, target })
+                                } else {
+                                    InstExt::nop()
+                                }
                             }
                             Inst::Load {
                                 kind,
@@ -8431,11 +8575,11 @@ where
                                 base: _,
                                 offset: _,
                             } => {
-                                let Some(dst) = cast_reg_non_zero(dst)? else {
-                                    return Err(ProgramFromElfError::other("R_RISCV_LO12_I with a zero destination register"));
-                                };
-
-                                InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target })
+                                if let Some(dst) = cast_reg_non_zero(dst)? {
+                                    InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target })
+                                } else {
+                                    InstExt::nop()
+                                }
                             }
                             _ => {
                                 return Err(ProgramFromElfError::other(format!(
@@ -8727,6 +8871,10 @@ where
     for sym in elf.symbols() {
         match sym.kind() {
             object::elf::STT_FUNC => {
+                if sym.is_undefined() {
+                    continue;
+                }
+
                 let (section, offset) = sym.section_and_offset()?;
                 let Some(name) = sym.name() else { continue };
 
@@ -8752,22 +8900,31 @@ where
     Ok(functions)
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum OptLevel {
+    O0,
+    O1,
+    O2,
+}
+
 pub struct Config {
     strip: bool,
-    optimize: bool,
+    opt_level: OptLevel,
     inline_threshold: usize,
     elide_unnecessary_loads: bool,
     dispatch_table: Vec<Vec<u8>>,
+    min_stack_size: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             strip: false,
-            optimize: true,
+            opt_level: OptLevel::O2,
             inline_threshold: 2,
             elide_unnecessary_loads: true,
             dispatch_table: Vec::new(),
+            min_stack_size: VM_MIN_PAGE_SIZE * 2,
         }
     }
 }
@@ -8779,7 +8936,12 @@ impl Config {
     }
 
     pub fn set_optimize(&mut self, value: bool) -> &mut Self {
-        self.optimize = value;
+        self.opt_level = if value { OptLevel::O2 } else { OptLevel::O0 };
+        self
+    }
+
+    pub fn set_opt_level(&mut self, value: OptLevel) -> &mut Self {
+        self.opt_level = value;
         self
     }
 
@@ -8795,6 +8957,11 @@ impl Config {
 
     pub fn set_dispatch_table(&mut self, dispatch_table: Vec<Vec<u8>>) -> &mut Self {
         self.dispatch_table = dispatch_table;
+        self
+    }
+
+    pub fn set_min_stack_size(&mut self, value: u32) -> &mut Self {
+        self.min_stack_size = value;
         self
     }
 }
@@ -8833,9 +9000,31 @@ where
     let mut sections_min_stack_size = Vec::new();
     let mut sections_other = Vec::new();
 
+    let mut section_map = RangeMap::new();
+
+    log::trace!("ELF sections:");
     for section in elf.sections() {
         let name = section.name();
         let is_writable = section.is_writable();
+        let kind = section.elf_section_type();
+
+        log::trace!(
+            " {}: 0x{:08x}..0x{:08x}: {} [ty={}] ({} bytes)",
+            section.index(),
+            section.original_address(),
+            section.original_address() + section.size(),
+            name,
+            kind,
+            section.size()
+        );
+
+        if section.is_allocated() && section.original_address() != 0 {
+            section_map.insert(
+                section.original_address()..section.original_address() + section.size(),
+                section.index(),
+            );
+        }
+
         if name == ".rodata"
             || name.starts_with(".rodata.")
             || name.starts_with(".srodata.")
@@ -8868,7 +9057,7 @@ where
             }
 
             sections_bss.push(section.index());
-        } else if name == ".text" || name.starts_with(".text.") {
+        } else if name == ".text" || name.starts_with(".text.") || (section.is_allocated() && section.is_executable()) {
             if is_writable {
                 return Err(ProgramFromElfError::other(format!(
                     "expected section '{name}' to be read-only, yet it is writable"
@@ -8882,9 +9071,20 @@ where
             sections_exports.push(section.index());
         } else if name == ".polkavm_min_stack_size" {
             sections_min_stack_size.push(section.index());
-        } else if name == ".eh_frame" || name == ".got" {
+        } else if name == ".eh_frame" || name == ".got" || name == ".dynsym" || name == ".dynstr" || name == ".dynamic" {
             continue;
         } else if section.is_allocated() {
+            if matches!(
+                kind,
+                object::elf::SHT_HASH
+                    | object::elf::SHT_GNU_HASH
+                    | object::elf::SHT_DYNSYM
+                    | object::elf::SHT_STRTAB
+                    | object::elf::SHT_RELA
+            ) {
+                continue;
+            }
+
             // We're supposed to load this section into memory at runtime, but we don't know what it is.
             return Err(ProgramFromElfErrorKind::UnsupportedSection(name.to_owned()).into());
         } else {
@@ -8988,8 +9188,9 @@ where
         .copied()
         .collect();
 
+    let section_to_function_name = elf.section_to_function_name();
     let all_jump_targets = harvest_all_jump_targets(&elf, &data_sections_set, &code_sections_set, &instructions, &relocations, &exports)?;
-    let all_blocks = split_code_into_basic_blocks(&elf, &all_jump_targets, instructions)?;
+    let all_blocks = split_code_into_basic_blocks(&elf, &section_to_function_name, &all_jump_targets, instructions)?;
     for block in &all_blocks {
         for source in block.next.source.as_slice() {
             assert!(source.offset_range.start < source.offset_range.end);
@@ -9002,9 +9203,15 @@ where
     let mut used_blocks;
 
     let mut regspill_size = 0;
-    if config.optimize {
+    if matches!(config.opt_level, OptLevel::O1 | OptLevel::O2) {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
-        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+        if matches!(config.opt_level, OptLevel::O2) {
+            optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+        } else {
+            for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
+                perform_nop_elimination(&mut all_blocks, current);
+            }
+        }
         used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
         spill_fake_registers(
             section_regspill,
@@ -9017,7 +9224,9 @@ where
         );
         used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
         merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
-        replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
+        if matches!(config.opt_level, OptLevel::O2) {
+            replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
+        }
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
@@ -9174,12 +9383,14 @@ where
         &sections_bss,
         &sections_min_stack_size,
         &mut base_address_for_section,
+        config.min_stack_size,
     )?;
 
     log::trace!("Memory configuration: {:#?}", memory_config);
 
     let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
     let code = emit_code(
+        &section_to_function_name,
         &imports,
         &base_address_for_section,
         section_got,
@@ -9188,8 +9399,9 @@ where
         &used_blocks,
         &used_imports,
         &jump_target_for_block,
-        config.optimize,
+        matches!(config.opt_level, OptLevel::O2),
         is_rv64,
+        memory_config.heap_base,
     )?;
 
     {
@@ -9278,7 +9490,7 @@ where
                     )));
                 };
 
-                let range = target_section_address.wrapping_add(target.offset)..origin_section_address.wrapping_add(origin.offset);
+                let range = origin_section_address.wrapping_add(origin.offset)..target_section_address.wrapping_add(target.offset);
                 let data = elf.section_data_mut(relocation_target.section_index);
                 let mut value = range.end.wrapping_sub(range.start);
                 match size {
@@ -9420,7 +9632,7 @@ where
     let mut location_map: HashMap<SectionTarget, Arc<[Location]>> = HashMap::new();
     if !config.strip {
         let mut string_cache = crate::utils::StringCache::default();
-        let dwarf_info = crate::dwarf::load_dwarf(&mut string_cache, &elf, &relocations)?;
+        let dwarf_info = crate::dwarf::load_dwarf(&mut string_cache, &elf, &relocations, &section_map)?;
         location_map = dwarf_info.location_map;
 
         // If there is no DWARF info present try to use the symbol table as a fallback.

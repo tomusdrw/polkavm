@@ -109,12 +109,15 @@ pub use crate::arch_bindings::{
     __NR_madvise as SYS_madvise,
     __NR_memfd_create as SYS_memfd_create,
     __NR_mmap as SYS_mmap,
+    __NR_mlock as SYS_mlock,
+    __NR_mlockall as SYS_mlockall,
     __NR_mount as SYS_mount,
     __NR_mprotect as SYS_mprotect,
     __NR_mremap as SYS_mremap,
     __NR_munmap as SYS_munmap,
     __NR_open as SYS_open,
     __NR_openat as SYS_openat,
+    __NR_perf_event_open as SYS_perf_event_open,
     __NR_pidfd_send_signal as SYS_pidfd_send_signal,
     __NR_pipe2 as SYS_pipe2,
     __NR_pivot_root as SYS_pivot_root,
@@ -124,6 +127,7 @@ pub use crate::arch_bindings::{
     __NR_ptrace as SYS_ptrace,
     __NR_read as SYS_read,
     __NR_recvmsg as SYS_recvmsg,
+    __NR_rseq as SYS_rseq,
     __NR_rt_sigaction as SYS_rt_sigaction,
     __NR_rt_sigprocmask as SYS_rt_sigprocmask,
     __NR_rt_sigreturn as SYS_rt_sigreturn,
@@ -475,6 +479,9 @@ pub use crate::arch_bindings::{
     MAP_POPULATE,
     MAP_PRIVATE,
     MAP_SHARED,
+    MCL_CURRENT,
+    MCL_FUTURE,
+    MCL_ONFAULT,
     MFD_ALLOW_SEALING,
     MFD_CLOEXEC,
     MINSIGSTKSZ,
@@ -511,6 +518,9 @@ pub use crate::arch_bindings::{
     RLIMIT_NPROC,
     RLIMIT_STACK,
     rlimit,
+    rseq_flags_RSEQ_FLAG_UNREGISTER as RSEQ_FLAG_UNREGISTER,
+    rseq,
+    rseq_cs,
     rusage,
     SA_NODEFER,
     SA_ONSTACK,
@@ -1837,6 +1847,21 @@ pub fn sys_ptrace_detach(pid: pid_t) -> Result<(), Error> {
     let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_DETACH, pid, 0, 0) };
     Error::from_syscall("ptrace (PTRACE_DETACH)", result)?;
     Ok(())
+}
+
+pub fn sys_ptrace_get_siginfo(pid: pid_t) -> Result<siginfo_t, Error> {
+    let mut siginfo: siginfo_t = unsafe { core::mem::zeroed() };
+    let result = unsafe {
+        syscall!(
+            SYS_ptrace,
+            crate::arch_bindings::PTRACE_GETSIGINFO,
+            pid,
+            0,
+            core::ptr::addr_of_mut!(siginfo)
+        )
+    };
+    Error::from_syscall("ptrace (PTRACE_GETSIGINFO)", result)?;
+    Ok(siginfo)
 }
 
 #[cfg(target_arch = "x86_64")]

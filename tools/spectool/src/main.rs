@@ -31,6 +31,7 @@ fn main_generate() {
 
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
+    config.set_allow_dynamic_paging(true);
 
     let engine = Engine::new(&config).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
@@ -46,8 +47,9 @@ fn main_generate() {
     for path in paths {
         let name = path.file_stem().unwrap().to_string_lossy();
         let input = std::fs::read_to_string(&path).unwrap();
+        let internal_name = format!("{path:?}");
 
-        let test_case = prepare_input(&input, &engine, &name, true);
+        let test_case = prepare_input(&input, &engine, &name, &internal_name, true);
         match test_case {
             Ok(case) => tests.push(case),
             Err(e) => {
@@ -180,7 +182,17 @@ fn main_generate() {
             writeln!(&mut index_md).unwrap();
         }
 
-        writeln!(&mut index_md, "Program should end with: {}\n", test.json.expected_status).unwrap();
+        assert_eq!(
+            test.json.expected_status == "page-fault",
+            test.json.expected_page_fault_address.is_some()
+        );
+        write!(&mut index_md, "Program should end with: {}", test.json.expected_status).unwrap();
+
+        if let Some(address) = test.json.expected_page_fault_address {
+            write!(&mut index_md, " (page address = 0x{:x})", address).unwrap();
+        }
+
+        writeln!(&mut index_md, "\n").unwrap();
         writeln!(&mut index_md, "Final value of the program counter: {}\n", test.json.expected_pc).unwrap();
         writeln!(
             &mut index_md,

@@ -787,13 +787,6 @@ where
 
         let count = conv_reg(Reg::A2.into());
 
-        // // Store the address to restart the memset in case we trigger a page fault.
-        // self.push(store(
-        //     RegSize::R64,
-        //     Self::vmctx_field(S::offset_table().next_native_program_counter),
-        //     rcx,
-        // ));
-
         // Grab the amount of gas we have (this will always be negative), and zero the gas counter.
         // (We assume the memset will consume all of the gas.)
         self.push(xor((RegSize::R32, rcx, rcx)));
@@ -1287,6 +1280,12 @@ where
 
     #[inline(always)]
     pub fn ecalli(&mut self, code_offset: u32, args_length: u32, imm: u32) {
+        if let Some(ref custom_codegen) = self.0.custom_codegen {
+            if !custom_codegen.should_emit_ecalli(imm, &mut self.0.asm) {
+                return;
+            }
+        }
+
         let ecall_label = self.ecall_label;
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(mov_imm(Self::vmctx_field(S::offset_table().arg), imm32(imm)));
@@ -2041,12 +2040,12 @@ where
     }
 
     #[inline(always)]
-    pub fn rotate_right_32_imm(&mut self, d: RawReg, s: RawReg, c: u32) {
+    pub fn rotate_right_imm_32(&mut self, d: RawReg, s: RawReg, c: u32) {
         self.rotate_right_imm_generic(RegSize::R32, d, s, c);
     }
 
     #[inline(always)]
-    pub fn rotate_right_64_imm(&mut self, d: RawReg, s: RawReg, c: u32) {
+    pub fn rotate_right_imm_64(&mut self, d: RawReg, s: RawReg, c: u32) {
         assert_eq!(B::BITNESS, Bitness::B64);
         self.rotate_right_imm_generic(RegSize::R64, d, s, c);
     }
@@ -2071,12 +2070,12 @@ where
     }
 
     #[inline(always)]
-    pub fn rotate_right_32_imm_alt(&mut self, d: RawReg, s: RawReg, c: u32) {
+    pub fn rotate_right_imm_alt_32(&mut self, d: RawReg, s: RawReg, c: u32) {
         self.rotate_right_imm_alt_generic(RegSize::R32, d, s, c);
     }
 
     #[inline(always)]
-    pub fn rotate_right_64_imm_alt(&mut self, d: RawReg, s: RawReg, c: u32) {
+    pub fn rotate_right_imm_alt_64(&mut self, d: RawReg, s: RawReg, c: u32) {
         assert_eq!(B::BITNESS, Bitness::B64);
         self.rotate_right_imm_alt_generic(RegSize::R64, d, s, c);
     }
@@ -2227,7 +2226,6 @@ where
     #[inline(always)]
     pub fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         assert_eq!(B::BITNESS, Bitness::B64);
-        // NOTE: For 32-bit the 'LoadKind::U32' is deliberate.
         self.load(dst, Some(base), offset, LoadKind::U32);
     }
 
