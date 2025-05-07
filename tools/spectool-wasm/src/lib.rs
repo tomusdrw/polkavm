@@ -108,7 +108,7 @@ pub @main:
     #[test]
     fn should_disassemble_code() {
         let engine = spectool::new_engine();
-        let result = spectool::prepare_input(ASSEMBLY, &engine, "wasm_asm", false).unwrap();
+        let result = spectool::prepare_input(ASSEMBLY, &engine, "wasm_asm", "wasm_asm", false).unwrap();
         let code_and_jump_table = result.json.program;
 
         let result = disassemble(code_and_jump_table).unwrap();
