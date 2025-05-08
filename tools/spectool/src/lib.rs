@@ -232,7 +232,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, internal_name: &s
         }
     }
 
-    if final_pc.0 != expected_final_pc {
+    if execute && final_pc.0 != expected_final_pc {
         let msg = format!("Unexpected final program counter for {internal_name}: expected {expected_final_pc}, is {final_pc}");
         eprintln!("{}", msg);
         return Err(msg);
