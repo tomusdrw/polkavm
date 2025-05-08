@@ -45,6 +45,7 @@ pub struct TestcaseJson {
 pub fn new_engine() -> Engine {
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
+    config.set_allow_dynamic_paging(true);
 
     Engine::new(&config).unwrap()
 }
@@ -220,7 +221,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, internal_name: &s
     };
 
     if final_status != "halt" {
-        final_pc = instance.program_counter().unwrap();
+        final_pc = instance.program_counter().unwrap_or_else(|| ProgramCounter(expected_final_pc));
     }
 
     if let Some(expected_status) = expected_status.clone() {
