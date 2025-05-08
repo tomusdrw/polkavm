@@ -45,6 +45,7 @@ pub struct TestcaseJson {
 pub fn new_engine() -> Engine {
     let mut config = polkavm::Config::new();
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
+    config.set_allow_dynamic_paging(true);
 
     Engine::new(&config).unwrap()
 }
