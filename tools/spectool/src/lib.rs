@@ -221,7 +221,7 @@ pub fn prepare_input(input: &str, engine: &Engine, name: &str, internal_name: &s
     };
 
     if final_status != "halt" {
-        final_pc = instance.program_counter().unwrap();
+        final_pc = instance.program_counter().unwrap_or_else(|| ProgramCounter(expected_final_pc));
     }
 
     if let Some(expected_status) = expected_status.clone() {

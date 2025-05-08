@@ -122,7 +122,7 @@ pub @main:
       : @1
      8: trap
       : @2
-     9: r7 = r7 + 0xffffffff
+     9: r7 = r7 + 0xffffffffffffffff
     12: jump @4 if r7 == 0
       : @3
     15: r10 = r8
@@ -131,8 +131,8 @@ pub @main:
     22: jump @2
       : @4
     24: r7 = r8
-    26: r8 = 0x0
-    28: r9 = 0x0
+    26: r8 = 0
+    28: r9 = 0
     30: fallthrough
       : @5
     31: jump [r0 + 0]
