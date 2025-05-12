@@ -6,13 +6,17 @@
 use clap::Parser;
 use core::fmt::Write;
 use polkavm::{Engine, Reg};
-use spectool::prepare_input;
+use spectool::{new_engine, prepare_input, Testcase};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
 enum Args {
     Generate,
+    Prepare {
+        /// The input file.
+        input: PathBuf,
+    },
     Test,
 }
 
@@ -21,6 +25,7 @@ fn main() {
 
     let args = Args::parse();
     match args {
+        Args::Prepare { input } => main_prepare(input),
         Args::Generate => main_generate(),
         Args::Test => main_test(),
     }
@@ -33,7 +38,7 @@ fn main_generate() {
     config.set_backend(Some(polkavm::BackendKind::Interpreter));
     config.set_allow_dynamic_paging(true);
 
-    let engine = Engine::new(&config).unwrap();
+    let engine = new_engine();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
     let mut found_errors = false;
 
@@ -210,6 +215,29 @@ fn main_generate() {
     }
 }
 
+fn prepare_file(engine: &Engine, path: &Path) -> Result<Testcase, String> {
+    let name = path.file_stem().unwrap().to_string_lossy();
+    let input = std::fs::read_to_string(path).unwrap();
+    let input = input.lines().collect::<Vec<_>>().join("\n");
+    let internal_name = format!("{path:?}");
+    prepare_input(&input, engine, &name, &internal_name, false)
+}
+
 fn main_test() {
     todo!();
+}
+
+fn main_prepare(input: PathBuf) {
+    let engine = new_engine();
+
+    let test = prepare_file(&engine, &input);
+    match test {
+        Ok(test) => {
+            let payload = serde_json::to_string_pretty(&test.json).unwrap();
+            println!("{payload}");
+        },
+        Err(e) => {
+            eprintln!("{e}");
+        },
+    }
 }
